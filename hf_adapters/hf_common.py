@@ -330,6 +330,7 @@ def encode_prompts(
     padding_side: str = "left",
     add_generation_prompt: bool = True,
     chat: bool | None = None,
+    chat_template_kwargs: dict | None = None,
 ):
     """Tokenize prompt(s) following the model's canonical input scheme.
 
@@ -337,6 +338,7 @@ def encode_prompts(
     trailing generation prompt. Base models use the tokenizer directly, which
     preserves the checkpoint's own special-token post-processor. ``chat`` can
     force either behavior; by default, the presence of a chat template decides.
+    ``chat_template_kwargs`` passes model-specific options to the chat template.
 
     Returns a padded ``BatchEncoding`` containing ``input_ids`` and
     ``attention_mask``. A single string is normalized to a one-row batch.
@@ -357,6 +359,7 @@ def encode_prompts(
             return_tensors="pt",
             padding=True,
             padding_side=padding_side,
+            **(chat_template_kwargs or {}),
         )
     return tokenizer(
         prompt_list,
