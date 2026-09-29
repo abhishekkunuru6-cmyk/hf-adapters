@@ -27,26 +27,22 @@ import torch.nn.functional as F
 from hf_adapters import hf_qwen3_5
 from hf_adapters.hf_common import (
     BLOCK_SIZE,
-    PrecomputedRotaryEmbedding,
     apply_rope_matmul,
-    get_backbone,
     kv_cache_update,
     moe_decode_selected_experts,
     moe_prefill_all_experts,
     optional_spyre_config_patch,
-    permute_proj_for_rope,
-    prepare_lm_head_for_spyre,
     prepare_moe_expert_weights,
     text_config,
 )
 from hf_adapters.hf_qwen3_5 import (
-    _allocate_caches,
-    _prepare_linear_attention_constants,
-    _rms_norm,
-    _split_gated_q_projection,
+    _make_linear_attention_block as _make_dense_linear_attention_block,
 )
 from hf_adapters.hf_qwen3_5 import (
-    _make_linear_attention_block as _make_dense_linear_attention_block,
+    _prepare_attention_projections,
+    _prepare_linear_attention_constants,
+    _rms_norm,
+    _setup_qwen3_5_text_decoder,
 )
 from hf_adapters.spyre_tensor_parallel import spyre_compiled_all_reduce
 
@@ -98,8 +94,12 @@ def _router_topk_cpu(x, router_weight, top_k):
 def _route_decode_on_cpu(x, mlp, top_k, stick_size):
     weights, expert_indices = _router_topk_cpu(x.to("cpu"), mlp.gate.weight, top_k)
     weights = weights[..., None].expand(-1, -1, stick_size).contiguous()
+    # Keep every routed expert index exact during CPU-to-Spyre transport. Model
+    # dtypes such as bfloat16 cannot represent every integer above 256.
     expert_indices = (
-        expert_indices.to(x.dtype)[..., None].expand(-1, -1, stick_size).contiguous()
+        expert_indices.to(torch.float32)[..., None]
+        .expand(-1, -1, stick_size)
+        .contiguous()
     )
     return weights.to(x.device), expert_indices.to(x.device)
 
@@ -352,43 +352,18 @@ def _make_linear_attention_block(layer, top_k, stick_size, tp_group_name=None):
 def prepare_for_spyre(model):
     """Prepare a text-only Qwen3.5 MoE causal LM for Spyre in place."""
     cfg = text_config(model.config)
-    unsupported = set(cfg.layer_types) - {"full_attention", "linear_attention"}
-    if unsupported:
-        raise ValueError(f"Unsupported Qwen3.5 MoE layer types: {sorted(unsupported)}")
-    if cfg.hidden_act != "silu":
-        raise ValueError(f"Unsupported Qwen3.5 MoE activation: {cfg.hidden_act}")
-    if cfg.linear_num_value_heads % cfg.linear_num_key_heads:
-        raise ValueError(
-            "linear_num_value_heads must be divisible by linear_num_key_heads"
-        )
-    if cfg.head_dim // 2 < BLOCK_SIZE:
-        raise ValueError(
-            f"Qwen3.5 MoE head_dim={cfg.head_dim} is too small for Spyre RoPE; "
-            "head padding is not implemented"
-        )
     if not 0 < cfg.num_experts_per_tok <= cfg.num_experts:
         raise ValueError(
             "num_experts_per_tok must be positive and no greater than num_experts"
         )
 
-    backbone = get_backbone(model)
+    cfg, backbone, rope_permutation = _setup_qwen3_5_text_decoder(model)
     # Keep the small router projections on CPU. Each layer crosses an explicit
     # graph boundary for exact fp32-softmax/top-k routing, then sends only the
     # selected indices and normalized weights back to Spyre.
     model._spyre_cpu_submodules = [
         name for name, _ in model.named_modules() if name.endswith(".mlp.gate")
     ]
-    rope_dim = int(cfg.partial_rotary_factor * cfg.head_dim)
-    if rope_dim % 2:
-        raise ValueError(f"Qwen3.5 MoE rotary dimension must be even, got {rope_dim}")
-
-    model._spyre_rope = PrecomputedRotaryEmbedding(
-        backbone.rotary_emb, padded_head_dim=cfg.head_dim
-    )
-    model._spyre_head_dim = cfg.head_dim
-    model._spyre_cache_allocator = _allocate_caches
-    model._spyre_prefill_chunk_size = BLOCK_SIZE
-    prepare_lm_head_for_spyre(model)
 
     try:
         from torch_spyre._C import get_elem_in_stick
@@ -397,24 +372,7 @@ def prepare_for_spyre(model):
     except ImportError:
         stick_size = BLOCK_SIZE
 
-    rope_half = rope_dim // 2
-    pass_half = (cfg.head_dim - rope_dim) // 2
-    rope_permutation = (
-        torch.cat(
-            [
-                torch.arange(0, rope_half),
-                torch.arange(rope_dim, rope_dim + pass_half),
-                torch.arange(rope_half, rope_dim),
-                torch.arange(rope_dim + pass_half, cfg.head_dim),
-            ]
-        )
-        if rope_dim != cfg.head_dim
-        else None
-    )
-    model._spyre_q_projs = nn.ModuleList()
-    model._spyre_gate_projs = nn.ModuleList()
     compiled_blocks = []
-
     for layer_type, layer in zip(cfg.layer_types, backbone.layers):
         mlp = layer.mlp
         expert_mesh = getattr(mlp.experts, "_hf_device_mesh", None)
@@ -424,41 +382,9 @@ def prepare_for_spyre(model):
         prepare_moe_expert_weights(mlp.experts)
 
         if layer_type == "full_attention":
-            local_query_heads = layer.self_attn.q_proj.weight.shape[0] // (
-                2 * cfg.head_dim
+            query_projection, gate_projection = _prepare_attention_projections(
+                model, layer, cfg.head_dim, rope_permutation
             )
-            local_kv_heads = layer.self_attn.k_proj.weight.shape[0] // cfg.head_dim
-            query_projection, gate_projection = _split_gated_q_projection(
-                layer.self_attn, local_query_heads, cfg.head_dim
-            )
-            layer.self_attn.q_proj = nn.Identity()
-            if rope_permutation is not None:
-                permute_proj_for_rope(
-                    query_projection,
-                    local_query_heads,
-                    cfg.head_dim,
-                    rope_permutation,
-                )
-                permute_proj_for_rope(
-                    layer.self_attn.k_proj,
-                    local_kv_heads,
-                    cfg.head_dim,
-                    rope_permutation,
-                )
-                q_norm_device = layer.self_attn.q_norm.weight.device
-                k_norm_device = layer.self_attn.k_norm.weight.device
-                layer.self_attn.q_norm.weight.data = (
-                    layer.self_attn.q_norm.weight.data.to("cpu")[rope_permutation]
-                    .contiguous()
-                    .to(q_norm_device)
-                )
-                layer.self_attn.k_norm.weight.data = (
-                    layer.self_attn.k_norm.weight.data.to("cpu")[rope_permutation]
-                    .contiguous()
-                    .to(k_norm_device)
-                )
-            model._spyre_q_projs.append(query_projection)
-            model._spyre_gate_projs.append(gate_projection)
             compiled_blocks.append(
                 _make_attention_block(
                     layer,
@@ -482,6 +408,3 @@ def prepare_for_spyre(model):
             )
 
     model._spyre_compiled_blocks = compiled_blocks
-    model._spyre_compiled_norm = torch.compile(
-        lambda hidden_states: _rms_norm(hidden_states, backbone.norm), dynamic=False
-    )

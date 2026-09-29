@@ -432,7 +432,7 @@ def _run_backbone_forward(
                 new_conv_state = mixed_qkv
             query, key, value = split_inputs(conv_output_cpu)
             query, key, value = normalize_inputs(query, key, value)
-            linear_attn = get_backbone(model).layers[index].linear_attn
+            linear_attn = backbone.layers[index].linear_attn
             core_output, new_recurrent_state = _delta_recurrence(
                 query,
                 key,
@@ -580,27 +580,43 @@ def _prepare_linear_attention_constants(linear_attn):
     linear_attn.conv1d = nn.Identity()
 
 
-def prepare_for_spyre(model):
-    """Apply dense text-only Qwen3.5 adaptations in-place."""
+def _setup_qwen3_5_text_decoder(model):
+    """Prepare shared Qwen3.5 state, leaving block construction to the caller."""
     cfg = text_config(model.config)
+    backbone = get_backbone(model)
     unsupported = set(cfg.layer_types) - {"full_attention", "linear_attention"}
     if unsupported:
         raise ValueError(f"Unsupported Qwen3.5 layer types: {sorted(unsupported)}")
+    if len(cfg.layer_types) != len(backbone.layers):
+        raise ValueError(
+            "Qwen3.5 layer_types must contain one entry per transformer layer, "
+            f"got {len(cfg.layer_types)} entries for {len(backbone.layers)} layers"
+        )
     if cfg.hidden_act != "silu":
         raise ValueError(f"Unsupported Qwen3.5 activation: {cfg.hidden_act}")
     if cfg.linear_num_value_heads % cfg.linear_num_key_heads:
         raise ValueError(
             "linear_num_value_heads must be divisible by linear_num_key_heads"
         )
+    if not 0 < cfg.linear_conv_kernel_dim <= BLOCK_SIZE:
+        raise ValueError(
+            f"Qwen3.5 linear_conv_kernel_dim must be between 1 and {BLOCK_SIZE}, "
+            f"got {cfg.linear_conv_kernel_dim}"
+        )
     if cfg.head_dim // 2 < BLOCK_SIZE:
         raise ValueError(
             f"Qwen3.5 head_dim={cfg.head_dim} is too small for Spyre RoPE; head padding is not implemented"
         )
 
-    backbone = get_backbone(model)
     rope_dim = int(cfg.partial_rotary_factor * cfg.head_dim)
     if rope_dim % 2:
         raise ValueError(f"Qwen3.5 rotary dimension must be even, got {rope_dim}")
+    non_rotary_dim = cfg.head_dim - rope_dim
+    if non_rotary_dim % 2:
+        raise ValueError(
+            f"Qwen3.5 non-rotary dimension must be even, got {non_rotary_dim}"
+        )
+
     model._spyre_rope = PrecomputedRotaryEmbedding(
         backbone.rotary_emb, padded_head_dim=cfg.head_dim
     )
@@ -608,55 +624,64 @@ def prepare_for_spyre(model):
     model._spyre_cache_allocator = _allocate_caches
     model._spyre_prefill_chunk_size = BLOCK_SIZE
     prepare_lm_head_for_spyre(model)
+    model._spyre_q_projs = nn.ModuleList()
+    model._spyre_gate_projs = nn.ModuleList()
+    model._spyre_compiled_norm = torch.compile(
+        lambda hidden_states: _rms_norm(hidden_states, backbone.norm), dynamic=False
+    )
 
     rope_permutation = (
         rope_dim_permutation(cfg.head_dim, rope_dim)
         if rope_dim != cfg.head_dim
         else None
     )
-    model._spyre_q_projs = nn.ModuleList()
-    model._spyre_gate_projs = nn.ModuleList()
+    return cfg, backbone, rope_permutation
+
+
+def _prepare_attention_projections(model, layer, head_dim, rope_permutation):
+    """Split and RoPE-permute one Qwen3.5 gated attention projection."""
+    local_query_heads = layer.self_attn.q_proj.weight.shape[0] // (2 * head_dim)
+    local_kv_heads = layer.self_attn.k_proj.weight.shape[0] // head_dim
+    query_projection, gate_projection = _split_gated_q_projection(
+        layer.self_attn, local_query_heads, head_dim
+    )
+    # The split projections contain all original rows; do not carry the doubled
+    # source parameter onto the accelerator as a third copy.
+    layer.self_attn.q_proj = nn.Identity()
+    if rope_permutation is not None:
+        permute_proj_for_rope(
+            query_projection, local_query_heads, head_dim, rope_permutation
+        )
+        permute_proj_for_rope(
+            layer.self_attn.k_proj, local_kv_heads, head_dim, rope_permutation
+        )
+        q_norm_device = layer.self_attn.q_norm.weight.device
+        k_norm_device = layer.self_attn.k_norm.weight.device
+        layer.self_attn.q_norm.weight.data = (
+            layer.self_attn.q_norm.weight.data.to("cpu")[rope_permutation]
+            .contiguous()
+            .to(q_norm_device)
+        )
+        layer.self_attn.k_norm.weight.data = (
+            layer.self_attn.k_norm.weight.data.to("cpu")[rope_permutation]
+            .contiguous()
+            .to(k_norm_device)
+        )
+    model._spyre_q_projs.append(query_projection)
+    model._spyre_gate_projs.append(gate_projection)
+    return query_projection, gate_projection
+
+
+def prepare_for_spyre(model):
+    """Apply dense text-only Qwen3.5 adaptations in-place."""
+    cfg, backbone, rope_permutation = _setup_qwen3_5_text_decoder(model)
     compiled_blocks = []
 
     for layer_type, layer in zip(cfg.layer_types, backbone.layers):
         if layer_type == "full_attention":
-            local_query_heads = layer.self_attn.q_proj.weight.shape[0] // (
-                2 * cfg.head_dim
+            query_projection, gate_projection = _prepare_attention_projections(
+                model, layer, cfg.head_dim, rope_permutation
             )
-            local_kv_heads = layer.self_attn.k_proj.weight.shape[0] // cfg.head_dim
-            query_projection, gate_projection = _split_gated_q_projection(
-                layer.self_attn, local_query_heads, cfg.head_dim
-            )
-            # The split projections contain all original rows; do not carry the
-            # doubled source parameter onto the accelerator as a third copy.
-            layer.self_attn.q_proj = nn.Identity()
-            if rope_permutation is not None:
-                permute_proj_for_rope(
-                    query_projection,
-                    local_query_heads,
-                    cfg.head_dim,
-                    rope_permutation,
-                )
-                permute_proj_for_rope(
-                    layer.self_attn.k_proj,
-                    local_kv_heads,
-                    cfg.head_dim,
-                    rope_permutation,
-                )
-                q_norm_device = layer.self_attn.q_norm.weight.device
-                k_norm_device = layer.self_attn.k_norm.weight.device
-                layer.self_attn.q_norm.weight.data = (
-                    layer.self_attn.q_norm.weight.data.to("cpu")[rope_permutation]
-                    .contiguous()
-                    .to(q_norm_device)
-                )
-                layer.self_attn.k_norm.weight.data = (
-                    layer.self_attn.k_norm.weight.data.to("cpu")[rope_permutation]
-                    .contiguous()
-                    .to(k_norm_device)
-                )
-            model._spyre_q_projs.append(query_projection)
-            model._spyre_gate_projs.append(gate_projection)
             compiled_blocks.append(
                 _make_attention_block(
                     layer, query_projection, gate_projection, cfg.head_dim
@@ -667,6 +692,3 @@ def prepare_for_spyre(model):
             compiled_blocks.append(_make_linear_attention_block(layer))
 
     model._spyre_compiled_blocks = compiled_blocks
-    model._spyre_compiled_norm = torch.compile(
-        lambda hidden_states: _rms_norm(hidden_states, backbone.norm), dynamic=False
-    )

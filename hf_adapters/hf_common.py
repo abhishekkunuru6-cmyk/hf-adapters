@@ -24,6 +24,7 @@ compiled block functions.
 import math
 import os
 import time
+import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
@@ -2602,8 +2603,9 @@ def generate(
             stock ``generate()``).
         timing: Print per-token latency.
         prefill_chunk_size (via generation_config or kwargs): Query length for
-            each prefill chunk. Falls back to the adapter's configured chunk
-            size, or one-shot prefill when the adapter has no override.
+            each prefill chunk when the adapter does not configure one. An
+            adapter-configured chunk size takes precedence; an explicit caller
+            value is ignored with a warning. Without either, prefill is one-shot.
     """
     overrides = {
         "max_new_tokens": max_new_tokens,
@@ -2633,9 +2635,23 @@ def generate(
         model, generation_config, overrides, kwargs
     )
 
-    prefill_chunk_size = getattr(cfg, "prefill_chunk_size", None)
-    if prefill_chunk_size is None:
-        prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
+    configured_prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
+    requested_prefill_chunk_size = getattr(cfg, "prefill_chunk_size", None)
+    if (
+        configured_prefill_chunk_size is not None
+        and requested_prefill_chunk_size is not None
+    ):
+        warnings.warn(
+            f"Ignoring prefill_chunk_size={requested_prefill_chunk_size!r}; "
+            f"this model requires prefill_chunk_size={configured_prefill_chunk_size!r}.",
+            UserWarning,
+            stacklevel=2,
+        )
+    prefill_chunk_size = (
+        configured_prefill_chunk_size
+        if configured_prefill_chunk_size is not None
+        else requested_prefill_chunk_size
+    )
     if prefill_chunk_size is not None and (
         isinstance(prefill_chunk_size, bool)
         or not isinstance(prefill_chunk_size, int)
