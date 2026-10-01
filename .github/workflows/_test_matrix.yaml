@@ -173,6 +173,8 @@ env:
   CLONED_HF_ADAPTERS_DIR: ${{ github.workspace }}
   STORAGE_1_DIR: /storage-1/hf-adapters
   HF_HOME: /storage-1/hf-adapters/.cache/huggingface
+  # Registry models are pre-warmed in the HF_HOME PVC; offline mode skips the Hub revision-check request that from_pretrained() otherwise makes even on a cache hit.
+  HF_HUB_OFFLINE: "1"
   # Stock VLM logits/captions are independent of hf-adapters and expensive to
   # regenerate on CPU. The test keys these compact references by model commit,
   # stack versions, generation settings, dtype, prompt, and input tensor bytes.
@@ -304,6 +306,54 @@ jobs:
             echo "| job | hf-adapters SHA | torch-spyre SHA |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # One `artifact-id` record per run for push-test-results-to-clickhouse's v2 ingest. Must run
+  # on the image under test: the base artifact_id lives in its filesystem. Never gates the run.
+  artifact-identity:
+    name: Derive artifact identity
+    needs: [resolve-torch-spyre]
+    if: ${{ always() && !inputs.skip_tests && (needs.resolve-torch-spyre.result == 'success' || needs.resolve-torch-spyre.result == 'skipped') }}
+    continue-on-error: true
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - ${{ inputs.image_label }}
+    timeout-minutes: 10
+    steps:
+      # At torch-spyre main, the same ref the v2 ingest action runs, so both use one id formula.
+      - name: Checkout the identity library
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: torch-spyre/torch-spyre
+          ref: main
+          path: .torch-spyre-identity
+          sparse-checkout: |
+            .github/scripts/derive_artifact_id.py
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      # hf-adapters always runs from a fresh clone; torch-spyre is on top only when pinned.
+      - name: Describe what this run installs on top of the image
+        id: delta
+        env:
+          HEAD_SHA: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          TORCH_SPYRE_SHA: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
+        run: |
+          TOKENS="hf-adapters@${HEAD_SHA:0:12}"
+          if [[ -n "${TORCH_SPYRE_SHA}" ]]; then
+            TOKENS="${TOKENS} torch-spyre@${TORCH_SPYRE_SHA:0:12}"
+          fi
+          echo "installed on top: ${TOKENS}"
+          echo "installed=${TOKENS}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive and upload the artifact identity
+        uses: torch-spyre/torch-spyre/.github/actions/derive-gha-artifact-id@main
+        with:
+          component: hf-adapters
+          arch: x86_64
+          installed: ${{ steps.delta.outputs.installed }}
+          library-dir: ${{ github.workspace }}/.torch-spyre-identity
 
   pre-commit:
     name: pre-commit

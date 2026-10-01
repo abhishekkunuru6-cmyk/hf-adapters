@@ -231,6 +231,26 @@ jobs:
           echo "Threaded run_id: ${RID:-<none, ingest will derive>}"
           echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
 
+      # Uploaded by _test_matrix's artifact-identity job. Empty (unadopted run, image with no
+      # stamped id, any fetch error) makes the v2 ingest write cases only, never fail.
+      - name: Recover this run's artifact_id
+        id: leg-artifact-id
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REC=""
+          AID=$(gh api --paginate \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "artifact-id" and (.expired | not)) | .id' | head -1) || true
+          if [[ -n "${AID}" ]]; then
+            gh api "/repos/${{ github.repository }}/actions/artifacts/${AID}/zip" > artifact-id.zip || true
+            unzip -o -q artifact-id.zip -d artifact-id-dir || true
+            REC=$(tr -d '[:space:]' < artifact-id-dir/artifact-id.txt 2>/dev/null || echo "")
+          fi
+          LEG_AID="${REC%%|*}"
+          echo "Leg artifact_id: ${LEG_AID:-<none, no artifact rows>}"
+          echo "value=${REC}" >> "${GITHUB_OUTPUT}"
+
       - name: Extract suite tier from display title
         id: extract-tier
         run: |
@@ -316,6 +336,8 @@ jobs:
           sha: ${{ env.TRIGGERING_SHA }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          repository: ${{ github.repository }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
