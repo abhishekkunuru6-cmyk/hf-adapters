@@ -186,12 +186,13 @@ all pass that check.
 > adapter or verify a checkpoint, update *only* this file (and the badge
 > counts in README.md, noted below).
 
-**Coverage:** 39 adapters · 62 verified checkpoints · 10K+ compatible models.
+**Coverage:** 40 adapters · 62 verified checkpoints · 10K+ compatible models.
 The 62 verified rows are 39 generative + 13 embedding + 2 seq-classification +
 2 token-classification + 6 vision-language (see the Verified Checkpoints tables
 above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
 used by VLM adapters and are not included in the adapter count. The three DSpark
-speculative-decoding drafter adapters are included in the adapter count.
+speculative-decoding drafter adapters and the XPress drafter adapter are included
+in the adapter count.
 Granite Vision 4.1 is verified both as a text backbone (generative) and as a full VLM.
 `hf_mistral3_vision_mm` covers both the ``mistral`` text-backbone variant
 (Mistral-Small-3.1/3.2) and the ``ministral3`` variant (Ministral-3-14B-Instruct-2512,
@@ -225,6 +226,7 @@ pattern, norms, and weight layout.
 | hf\_gemma4.py | gemma4\_unified / gemma4 (dense + PLE/KV-share) | 4 | Gemma 4 31B (dense). Not 26B-A4B (MoE). |
 | hf\_gemma4\_mm.py | gemma4\_unified / gemma4 (multimodal) | 4 | Encoder-free dense unified VLMs plus full-vision PLE/KV-share and MoE variants. Combined MoE+PLE/KV-share remains unsupported. |
 | hf\_gemma4\_moe.py | gemma4 (MoE, `enable_moe_block`) | 1 | Gemma 4 26B-A4B (128 experts, top-8 routing). Persistent prefill + gathered decode, 5/5 token match. |
+| hf\_xpress\_qwen3.py | qwen3 (`Qwen3XPressModel` drafter) | 0 | XPress speculative-decoding drafter: DFlash block backbone (Qwen3-style layers, mixed sliding/full) + causal refiner, block 16, K=6 Jacobi passes, top-C=512. Vocab weights from the target. UIUC-SSAIL/gemma4-26b-a4b-XPress-b16 (Gemma 4 26B-A4B target); same adapter should load UIUC-SSAIL/Qwen3-8B-XPress-b16. Block-propose API (`propose_block`), CPU-verified against the speculators training math; Spyre run pending. |
 | hf\_diffusion\_gemma.py | diffusion\_gemma | 1 | google/diffusiongemma-26B-A4B-it. MoE runs on CPU; attention + dense MLP compiled on Spyre. Block-diffusion generate loop. Gated. |
 | hf\_gemma3.py | gemma3\_text / gemma3 (dense) | 2 | Gemma 3 4B/12B/27B (text decoder of the multimodal checkpoints); EmbeddingGemma (bidirectional embedder). Not Gemma 3n (PLE). |
 | hf\_gemma2.py | gemma2 | 1 | Gemma 2 2B and Gemma 2 fine-tunes. |

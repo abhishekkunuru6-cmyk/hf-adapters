@@ -397,6 +397,18 @@ CAUSAL_LM_MODELS = {
         "size": "1b",
         "kind": "dspark_draft",
     },
+    # XPress speculative-decoding drafter (DFlash backbone + causal refiner),
+    # Qwen3-style layers for a Gemma 4 26B-A4B target. Exercised by
+    # tests/spyre/test_xpress_draft_spyre.py; vocab weights come from "target".
+    # hf_xpress_qwen3.py
+    "xpress_gemma4_26b": {
+        "name": "XPress Gemma 4 26B-A4B Drafter (b16)",
+        "path": "UIUC-SSAIL/gemma4-26b-a4b-XPress-b16",
+        "adapter": "hf_xpress_qwen3.py",
+        "size": "0.6b",
+        "kind": "xpress_draft",
+        "target": "google/gemma-4-26B-A4B-it",
+    },
     "diffusiongemma_26b": {
         "name": "DiffusionGemma 26B-A4B-it",
         "path": "google/diffusiongemma-26B-A4B-it",
@@ -798,10 +810,12 @@ def _exclude(paths: list[str]) -> list[str]:
 _include_gated_flag = _include_gated()
 
 
-# ``kind == "dspark_draft"`` entries are speculative-decoding drafters (block
-# proposers, driven by ``_run_draft_block`` — no ``generate``), so they are
-# registered for adapter-coverage but excluded from the generate-based CPU/Spyre
-# causal-LM harnesses; they are exercised by tests/spyre/test_dspark_draft_spyre.py.
+# ``DRAFTER_KINDS`` entries are speculative-decoding drafters (block proposers,
+# driven by ``_run_draft_block`` / ``propose_block`` — no ``generate``), so they
+# are registered for adapter-coverage but excluded from the generate-based
+# CPU/Spyre causal-LM harnesses; they are exercised by
+# tests/spyre/test_dspark_draft_spyre.py and tests/spyre/test_xpress_draft_spyre.py.
+DRAFTER_KINDS = ("dspark_draft", "xpress_draft")
 # ``kind == "diffusion"`` entries (e.g. DiffusionGemma) use a block-diffusion
 # generate loop that is incompatible with the AR causal-LM harness; they are
 # exercised by tests/spyre/test_diffusion_gemma.py.
@@ -809,7 +823,7 @@ CAUSAL_PATHS: list[str] = _exclude(
     _select_representative_paths(
         CAUSAL_LM_MODELS,
         include_gated=_include_gated_flag,
-        predicate=lambda info: info.get("kind") not in ("dspark_draft", "diffusion"),
+        predicate=lambda info: info.get("kind") not in (*DRAFTER_KINDS, "diffusion"),
     )
 )
 MULTICARD_SMOKE_PATHS: list[str] = _exclude(
@@ -827,6 +841,14 @@ DSPARK_PATHS: list[str] = _exclude(
         CAUSAL_LM_MODELS,
         include_gated=_include_gated_flag,
         predicate=lambda info: info.get("kind") == "dspark_draft",
+    )
+)
+# The XPress drafter checkpoints — exercised by tests/spyre/test_xpress_draft_spyre.py.
+XPRESS_PATHS: list[str] = _exclude(
+    _select_representative_paths(
+        CAUSAL_LM_MODELS,
+        include_gated=_include_gated_flag,
+        predicate=lambda info: info.get("kind") == "xpress_draft",
     )
 )
 EMBED_PATHS: list[str] = _exclude(
@@ -913,7 +935,7 @@ ALL_CAUSAL_PATHS: list[str] = _exclude(
     _all_paths(
         CAUSAL_LM_MODELS,
         include_gated=_include_gated_flag,
-        predicate=lambda info: info.get("kind") not in ("dspark_draft", "diffusion"),
+        predicate=lambda info: info.get("kind") not in (*DRAFTER_KINDS, "diffusion"),
     )
 )
 ALL_EMBED_PATHS: list[str] = _exclude(
