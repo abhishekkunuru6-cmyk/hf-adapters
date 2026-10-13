@@ -189,14 +189,16 @@ def _head(refiner_cls, weights):
 def test_refiner_bias_matches_training_formula(refiner_cls):
     w = _training_head_weights()
     head = _head(refiner_cls, {f"refiner_head.{k}": v for k, v in w.items()})
-    hidden = torch.randn(1, BLOCK, HIDDEN)
-    prev = torch.randint(0, VOCAB, (1, BLOCK))
+    g = torch.Generator().manual_seed(5)
+    hidden = torch.randn(1, BLOCK, HIDDEN, generator=g)
+    prev = torch.randint(0, VOCAB, (1, BLOCK), generator=g)
 
+    # Folding reassociates fp32 sums: allow that rounding, not a formula change.
     torch.testing.assert_close(
         head.bias(prev, hidden),
         reference_refiner_bias(w, prev, hidden),
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=1e-3,
+        atol=1e-3,
     )
 
 
@@ -227,8 +229,9 @@ def test_refiner_mixer_is_causal(refiner_cls):
     """Changing slot j's previous token never moves the bias of a slot < j —
     the property that makes the Jacobi fixed point exist."""
     head = _head(refiner_cls, _published(_training_head_weights()))
-    hidden = torch.randn(1, BLOCK, HIDDEN)
-    prev = torch.randint(0, VOCAB, (1, BLOCK))
+    g = torch.Generator().manual_seed(6)
+    hidden = torch.randn(1, BLOCK, HIDDEN, generator=g)
+    prev = torch.randint(0, VOCAB, (1, BLOCK), generator=g)
     base = head.bias(prev, hidden)
     j = BLOCK // 2
     changed = prev.clone()
@@ -285,9 +288,45 @@ def test_draft_block_matches_reference(module, ctx_len):
 
     module.prepare_for_spyre(model, ctx_pad=CTX_PAD)
     _unwrap_xpress(model)
-    actual = module.run_draft_block(model, feats, positions, anchor_id=7)
+    if ctx_len > CTX_PAD:
+        with pytest.warns(UserWarning, match="truncated"):
+            actual = module.run_draft_block(model, feats, positions, anchor_id=7)
+    else:
+        actual = module.run_draft_block(model, feats, positions, anchor_id=7)
 
     torch.testing.assert_close(actual.float(), expected, rtol=1e-4, atol=1e-4)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "feats_shape, positions, anchor, match",
+    [
+        ((1, 0, TAPS * HIDDEN), torch.arange(0), 7, "at least one"),
+        ((1, 10, TAPS * HIDDEN), torch.arange(9), 7, "one position per"),
+        ((1, 10, HIDDEN), torch.arange(10), 7, "width"),
+        ((2, 10, TAPS * HIDDEN), torch.arange(10), 7, r"\[1, L"),
+        ((1, 3, TAPS * HIDDEN), torch.tensor([0, 2, 1]), 7, "increasing"),
+        ((1, 10, TAPS * HIDDEN), torch.arange(10), VOCAB, "anchor_id"),
+    ],
+)
+def test_draft_block_rejects_bad_context(module, feats_shape, positions, anchor, match):
+    model = _loaded_drafter(module)
+    module.prepare_for_spyre(model, ctx_pad=CTX_PAD)
+    _unwrap_xpress(model)
+    with pytest.raises(ValueError, match=match):
+        module.run_draft_block(model, torch.zeros(feats_shape), positions, anchor)
+
+
+def test_prepare_keeps_cpu_only_modules_and_pads_readout(module):
+    from hf_adapters.hf_common import padded_vocab_size
+
+    model = _loaded_drafter(module)
+    module.prepare_for_spyre(model, ctx_pad=CTX_PAD)
+    assert {"fc", "hidden_norm"} <= set(model._spyre_cpu_submodules)
+    readout = model.xpress_readout.weight
+    assert readout.shape == (padded_vocab_size(VOCAB, RANK, 4), RANK)
+    assert torch.equal(readout[:VOCAB], model.xpress_head.readout.weight)
+    assert not readout[VOCAB:].any()
 
 
 @torch.no_grad()
@@ -399,6 +438,35 @@ def test_load_model_from_checkpoint_dir(module, tmp_path):
     torch.testing.assert_close(model.embed_tokens.weight, embed)
     torch.testing.assert_close(model.lm_head.weight, embed)  # tied to the target
     assert not any(p.isnan().any() for p in model.parameters())
+
+
+@torch.no_grad()
+def test_bf16_load_keeps_fp32_rope_and_one_vocab_matrix(module, tmp_path):
+    """A bf16 inv_freq drifts RoPE angles by radians at large positions, and the
+    dtype cast must not leave two copies of the target's vocab matrix."""
+    _write_checkpoint(tmp_path, module)
+    model = module.load_model(
+        str(tmp_path), target_embed_weight=_target_embedding(), dtype=torch.bfloat16
+    )
+    assert model.rotary_emb.inv_freq.dtype == torch.float32
+    assert model.lm_head.weight is model.embed_tokens.weight
+
+    pos = torch.tensor([[4000]])
+    _, sin = model.rotary_emb(torch.zeros(1, 1, HIDDEN), pos)
+    head_dim = _config().head_dim
+    inv_freq = 1.0 / 1_000_000 ** (torch.arange(0, head_dim, 2).double() / head_dim)
+    expected = torch.sin(4000 * inv_freq).float()
+    torch.testing.assert_close(sin[0, 0, : head_dim // 2], expected, atol=1e-3, rtol=0)
+
+
+def test_build_leaves_callers_config_untouched(module):
+    config = _config()
+    config._attn_implementation = "eager"
+    before = config.to_dict()
+    model = module.build_drafter(config)
+    assert config._attn_implementation == "eager"
+    assert config.to_dict() == before
+    assert model.config._attn_implementation == "sdpa"
 
 
 @pytest.mark.parametrize("sharded", [False, True])

@@ -1163,19 +1163,27 @@ def pad_lm_head(model, *, min_vocab_size: int | None = None):
         return
     w = head.weight
     vocab = w.shape[0]
-    target_vocab = max(vocab, min_vocab_size or vocab)
-    hidden = w.shape[1]
-    dtype_bytes = w.element_size()
-    # Max residual sticks whose per-core span fits the EAR limit.
-    max_residual = _EAR_LIMIT_BYTES // (hidden * BLOCK_SIZE * dtype_bytes)
-    sticks = (target_vocab + BLOCK_SIZE - 1) // BLOCK_SIZE
-    while _largest_prime_factor(sticks) > max_residual:
-        sticks += 1
-    padded = sticks * BLOCK_SIZE
+    padded = padded_vocab_size(
+        max(vocab, min_vocab_size or vocab), w.shape[1], w.element_size()
+    )
     if padded != vocab:
         head.weight = nn.Parameter(
             F.pad(w, (0, 0, 0, padded - vocab)), requires_grad=False
         )
+
+
+def padded_vocab_size(vocab: int, hidden: int, dtype_bytes: int) -> int:
+    """Smallest stick-aligned output width >= ``vocab`` that fits the EAR limit.
+
+    The padding rule of :func:`pad_lm_head`, for any ``[vocab, hidden]``
+    output-projection weight that is not the model's ``lm_head``.
+    """
+    # Max residual sticks whose per-core span fits the EAR limit.
+    max_residual = _EAR_LIMIT_BYTES // (hidden * BLOCK_SIZE * dtype_bytes)
+    sticks = (vocab + BLOCK_SIZE - 1) // BLOCK_SIZE
+    while _largest_prime_factor(sticks) > max_residual:
+        sticks += 1
+    return sticks * BLOCK_SIZE
 
 
 def prepare_lm_head_for_spyre(

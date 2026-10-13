@@ -58,10 +58,11 @@ def _target_embedding(module, ckpt: str) -> torch.Tensor:
     return module.load_target_embedding(target)
 
 
-def _context(model, seed: int = 0):
+def _context(model, start: int, seed: int = 0):
     g = torch.Generator().manual_seed(seed)
     width = len(model.target_layer_ids) * model.config.hidden_size
-    return torch.randn(1, CTX_LEN, width, generator=g), torch.arange(CTX_LEN)
+    positions = start + torch.arange(CTX_LEN)
+    return torch.randn(1, CTX_LEN, width, generator=g), positions
 
 
 def _min_row_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -70,43 +71,42 @@ def _min_row_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     )
 
 
+# Position 4000 exercises RoPE far from 0, where a reduced-precision inv_freq
+# would drift the rotation angles by radians.
+@pytest.mark.parametrize("start", [0, 4000], ids=["pos0", "pos4000"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("ckpt", XPRESS_PATHS)
 @torch.no_grad()
-def test_xpress_propose_block(ckpt, dtype):
+def test_xpress_propose_block(ckpt, dtype, start):
     import torch_spyre  # noqa: F401
 
     from hf_adapters import hf_common
     from hf_adapters._xpress_refiner import canonical_head_weights
     from hf_adapters.auto_spyre_model import resolve_adapter_module
 
-    torch.spyre.set_device(0)
-    hf_common.DEVICE = torch.device("spyre:0")
+    # hf_common.DEVICE (spyre:$LOCAL_RANK) is bound into the adapters at import;
+    # select the same card instead of overriding it.
+    torch.spyre.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     module = resolve_adapter_module(ckpt)
     assert module.__name__.endswith("hf_xpress_qwen3"), module.__name__
 
     embed = _target_embedding(module, ckpt)
-    oracle = module.load_model(ckpt, target_embed_weight=embed, dtype=torch.float32)
-    feats, positions = _context(oracle)
+    config, raw = module.read_checkpoint(ckpt)  # read once, for both models
+    oracle = module.build_model(config, raw, embed, dtype=torch.float32)
+    feats, positions = _context(oracle, start)
     ctx = slice(CTX_LEN - min(CTX_LEN, module.CTX_PAD), CTX_LEN)
     ref_hidden = reference_block_hidden(
         oracle, feats[:, ctx], positions[ctx], ANCHOR_ID
     )
     ref_base = oracle.lm_head(ref_hidden)
-    root = module._local_dir(ckpt, None, ["*.safetensors"])
-    raw = {
-        k: v
-        for f in os.listdir(root)
-        if f.endswith(".safetensors")
-        for k, v in load_file(os.path.join(root, f)).items()
-    }
     head_w = {k: v.float() for k, v in canonical_head_weights(raw).items()}
     ref_draft = reference_jacobi(
         head_w, ref_base, ref_hidden, ANCHOR_ID, ANCHOR_ID, oracle.num_passes
     )[0]
-    del oracle, raw
+    del oracle, head_w
 
-    model = module.load_model(ckpt, target_embed_weight=embed, dtype=dtype)
+    model = module.build_model(config, raw, embed, dtype=dtype)
+    del raw
     hf_common.move_model_to_spyre(model, module, dtype)
 
     hidden = module.run_draft_block(model, feats, positions, ANCHOR_ID)
@@ -127,7 +127,7 @@ def test_xpress_propose_block(ckpt, dtype):
             agree = int((draft == ref_draft).sum())
 
     print(
-        f"\n[xpress {dtype}] hidden cos={hidden_cos:.5f} base-logit cos={base_cos:.5f} "
+        f"\n[xpress {dtype} pos{start}+] hidden cos={hidden_cos:.5f} base-logit cos={base_cos:.5f} "
         f"draft agreement (topc=0 vs fp32 oracle) {agree}/{model.block_size - 1} "
         f"propose latency: "
         + ", ".join(f"topc={c}: {t * 1e3:.1f} ms" for c, t in timings.items())

@@ -76,6 +76,15 @@ unnormalized selected probabilities. Prefill evaluates all experts persistently;
 decode gathers only the selected experts. The BF16 path compiles and runs
 end-to-end with 5/5 top-1 agreement against the CPU reference.
 
+### Speculative-decoding drafter (block-propose)
+
+| Model | model\_type | Target | head\_dim | D/2 | Stick Aligned | Oracle Accurate | Spyre Compiles | Spyre Runs |
+|-------|-----------|--------|---------|-----|--------------|----------------|---------------|-----------|
+| XPress Gemma 4 26B-A4B b16 (`UIUC-SSAIL/gemma4-26b-a4b-XPress-b16`) | qwen3 (`Qwen3XPressModel`) | Gemma 4 26B-A4B | 128 | 64 | Yes | Yes | Yes | Yes |
+
+**Oracle Accurate** = `propose_block` matches a plain-PyTorch transcription of the speculators training code on CPU (`tests/cpu/test_xpress_cpu.py`; a drafter has no stock-HF `generate` to compare against).
+**Spyre Runs** = `tests/spyre/test_xpress_draft_spyre.py` holds block-hidden and base-logit cosine ≥ 0.99 against the fp32 oracle on the real checkpoint (bf16: 0.9998 / 0.9999).
+
 ### Vision-Language (image→text)
 
 Full multimodal VLMs: a vision tower (image → patch features) plus a causal text
@@ -186,10 +195,10 @@ all pass that check.
 > adapter or verify a checkpoint, update *only* this file (and the badge
 > counts in README.md, noted below).
 
-**Coverage:** 40 adapters · 62 verified checkpoints · 10K+ compatible models.
-The 62 verified rows are 39 generative + 13 embedding + 2 seq-classification +
-2 token-classification + 6 vision-language (see the Verified Checkpoints tables
-above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
+**Coverage:** 40 adapters · 63 verified checkpoints · 10K+ compatible models.
+The 63 verified rows are 39 generative + 13 embedding + 2 seq-classification +
+2 token-classification + 6 vision-language + 1 speculative-decoding drafter (see
+the Verified Checkpoints tables above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
 used by VLM adapters and are not included in the adapter count. The three DSpark
 speculative-decoding drafter adapters and the XPress drafter adapter are included
 in the adapter count.

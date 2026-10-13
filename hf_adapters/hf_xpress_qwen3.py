@@ -47,7 +47,10 @@ Spyre/CPU split (each boundary is a known Spyre limitation, not a choice):
 
 The context is a fixed-width window of the ``ctx_pad`` most recent target
 positions, re-projected every block (no draft-side KV cache yet), so shapes are
-static and every block compiles once.
+static and every block compiles once. This is narrower than training: there the
+full-attention layer sees the whole context and the sliding layers see
+``sliding_window`` (2048) positions. Longer contexts are truncated with a
+warning; pass a larger ``ctx_pad`` to ``prepare_for_spyre`` to keep more.
 
 Usage::
 
@@ -61,11 +64,12 @@ Usage::
     draft_ids = xp.propose_block(model, ctx_features, ctx_positions, anchor_id)
 """
 
+import copy
 import glob
 import json
 import os
+import warnings
 from collections.abc import Callable, Mapping
-from typing import cast
 
 import torch
 import torch.nn as nn
@@ -80,8 +84,11 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from hf_adapters._dspark_common import (
-    make_dspark_block,
+    compile_dspark_blocks,
+    embed_noise_block,
+    kv_pad_for,
     project_context,
+    snapshot_cpu_embeddings,
     snapshot_cpu_fc,
 )
 from hf_adapters._xpress_refiner import (
@@ -94,6 +101,7 @@ from hf_adapters.hf_common import (
     PrecomputedRotaryEmbedding,
     _mask_fill_value,
     pad_lm_head,
+    padded_vocab_size,
 )
 
 # 48 context rows + a 16-token block = kv_pad 64, the attention width the
@@ -146,6 +154,7 @@ class XPressDrafter(nn.Module):
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         _validate_config(config)
+        config = copy.deepcopy(config)  # leave the caller's config untouched
         config._attn_implementation = "sdpa"
         dflash = config.dflash_config
         hidden = config.hidden_size
@@ -272,6 +281,40 @@ def load_target_embedding(
     return embed
 
 
+def read_checkpoint(
+    model_path: str, revision: str | None = None
+) -> tuple[Qwen3Config, dict[str, torch.Tensor]]:
+    """Config and raw tensors of a drafter checkpoint (local dir or HF id)."""
+    root = _local_dir(model_path, revision, ["*.json", "*.safetensors"])
+    shards = sorted(glob.glob(os.path.join(root, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(f"No *.safetensors in {root}")
+    weights: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        weights.update(load_file(shard))
+    return Qwen3Config.from_pretrained(root), weights
+
+
+def build_model(
+    config: Qwen3Config,
+    weights: Mapping[str, torch.Tensor],
+    target_embed_weight: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> XPressDrafter:
+    """A ready (eval, frozen) drafter from already-read checkpoint tensors."""
+    with torch.device("meta"):
+        model = build_drafter(config)
+    load_drafter_weights(model, weights, target_embed_weight)
+    model = model.to(dtype).eval().requires_grad_(False)
+    # The cast split the shared vocab matrix into two copies; re-tie it (the
+    # Spyre move unties it again, for the device lm_head only).
+    model.lm_head.weight = model.embed_tokens.weight
+    # Rebuild the rotary after the cast: its buffers were on meta, and a bf16
+    # inv_freq drifts the RoPE angles by radians at positions in the thousands.
+    model.rotary_emb = Qwen3RotaryEmbedding(model.config)
+    return model
+
+
 def load_model(
     model_path: str,
     *,
@@ -285,16 +328,8 @@ def load_model(
         if target_path is None:
             raise ValueError("Pass target_embed_weight or target_path")
         target_embed_weight = load_target_embedding(target_path)
-    root = _local_dir(model_path, revision, ["*.json", "*.safetensors"])
-    config = Qwen3Config.from_pretrained(root)
-    weights: dict[str, torch.Tensor] = {}
-    for shard in sorted(glob.glob(os.path.join(root, "*.safetensors"))):
-        weights.update(load_file(shard))
-    with torch.device("meta"):
-        model = build_drafter(config)
-    load_drafter_weights(model, weights, target_embed_weight)
-    model.rotary_emb = Qwen3RotaryEmbedding(config)  # its buffers were on meta
-    return model.to(dtype).eval().requires_grad_(False)
+    config, weights = read_checkpoint(model_path, revision)
+    return build_model(config, weights, target_embed_weight, dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -302,49 +337,53 @@ def load_model(
 # ---------------------------------------------------------------------------
 
 
-def _kv_pad(ctx_pad: int, block_size: int) -> int:
-    return ((ctx_pad + block_size + 31) // 32) * 32
-
-
 def _compile(fn):
     return torch.compile(fn, dynamic=False)
 
 
+def _padded_readout(readout: torch.Tensor) -> nn.Linear:
+    """Device copy of the ``[vocab, rank]`` readout, padded like ``lm_head``.
+
+    Built on ``meta`` and given the padded weight, so no full-vocab random
+    init is allocated just to be replaced.
+    """
+    vocab, rank = readout.shape
+    padded = padded_vocab_size(vocab, rank, readout.element_size())
+    with torch.device("meta"):
+        linear = nn.Linear(rank, padded, bias=False)
+    linear.weight = nn.Parameter(
+        F.pad(readout.detach(), (0, 0, 0, padded - vocab)), requires_grad=False
+    )
+    return linear
+
+
 def prepare_for_spyre(model: XPressDrafter, ctx_pad: int = CTX_PAD) -> None:
-    """Compile the backbone + refiner and mark the CPU-resident gathers.
+    """Compile the backbone + refiner and mark the CPU-resident modules.
 
     Called by ``hf_common.move_model_to_spyre`` before the device move; the
-    modules in ``_spyre_cpu_submodules`` stay on CPU (gather-only weights).
+    modules in ``_spyre_cpu_submodules`` stay on CPU: the gather-only weights,
+    and ``fc``/``hidden_norm``, which only run from their CPU snapshot.
     """
+    if ctx_pad < 1:
+        raise ValueError(f"ctx_pad must be positive, got {ctx_pad}")
     pad_lm_head(model)
+    snapshot_cpu_embeddings(model)
     snapshot_cpu_fc(model)
     model._spyre_rope = PrecomputedRotaryEmbedding(model.rotary_emb)
     model._spyre_cpu_submodules = [
         "embed_tokens",
+        "fc",
+        "hidden_norm",
         "xpress_head.token_embed",
         "xpress_head.readout",
     ]
-    # Full-vocab readout runs on device: stick-padded copy of the readout.
-    readout = model.xpress_head.readout.weight
-    model.xpress_readout = nn.Linear(readout.shape[1], readout.shape[0], bias=False)
-    model.xpress_readout.weight = nn.Parameter(
-        F.pad(readout.detach(), (0, 0, 0, (-readout.shape[0]) % 64)),
-        requires_grad=False,
-    )
+    model.xpress_readout = _padded_readout(model.xpress_head.readout.weight)
 
-    kv_pad = _kv_pad(ctx_pad, model.block_size)
+    kv_pad = kv_pad_for(ctx_pad, model.block_size)
     model._spyre_xpress = {"ctx_pad": ctx_pad, "kv_pad": kv_pad}
-    model._spyre_compiled_blocks = [
-        make_dspark_block(
-            layer,
-            ctx_pad=ctx_pad,
-            block_size=model.block_size,
-            kv_pad=kv_pad,
-            use_qk_norm=True,
-            scaling=cast(Qwen3DecoderLayer, layer).self_attn.scaling,
-        )
-        for layer in model.layers
-    ]
+    model._spyre_compiled_blocks = compile_dspark_blocks(
+        model, ctx_pad=ctx_pad, kv_pad=kv_pad, use_qk_norm=True
+    )
     head = model.xpress_head
     model._spyre_xpress_fns = {
         "norm": _compile(model.norm),
@@ -395,8 +434,45 @@ def build_draft_masks(
     }
 
 
+def _check_context(
+    model: XPressDrafter,
+    ctx_features: torch.Tensor,
+    ctx_positions: torch.Tensor,
+    anchor_id: int,
+) -> None:
+    """Fail fast on inputs that would otherwise give silently wrong drafts."""
+    width = len(model.target_layer_ids) * model.config.hidden_size
+    if ctx_features.dim() != 3 or ctx_features.shape[0] != 1:
+        raise ValueError(
+            f"ctx_features must be [1, L, {width}], got {tuple(ctx_features.shape)}"
+        )
+    if ctx_features.shape[2] != width:
+        raise ValueError(
+            f"ctx_features width {ctx_features.shape[2]} != {width} "
+            f"({len(model.target_layer_ids)} target layers x hidden size)"
+        )
+    if ctx_positions.dim() != 1 or ctx_positions.shape[0] != ctx_features.shape[1]:
+        raise ValueError(
+            f"ctx_positions {tuple(ctx_positions.shape)} must be 1-D with one "
+            f"position per ctx_features row ({ctx_features.shape[1]})"
+        )
+    if ctx_positions.shape[0] == 0:
+        raise ValueError("XPress needs at least one target context position")
+    if ctx_positions.shape[0] > 1 and not bool((ctx_positions.diff() > 0).all()):
+        raise ValueError("ctx_positions must be strictly increasing")
+    if not 0 <= anchor_id < model.config.vocab_size:
+        raise ValueError(f"anchor_id {anchor_id} outside the vocabulary")
+
+
 def _window(ctx_features, ctx_positions, ctx_pad):
     """Keep the ``ctx_pad`` most recent context rows; zero-pad to ``ctx_pad``."""
+    if ctx_positions.shape[0] > ctx_pad:
+        warnings.warn(
+            f"XPress context of {ctx_positions.shape[0]} positions truncated to "
+            f"the {ctx_pad} most recent (ctx_pad); training attends to more. "
+            "Pass a larger ctx_pad to prepare_for_spyre to keep more.",
+            stacklevel=3,
+        )
     feats = ctx_features[:, -ctx_pad:].to("cpu", torch.float32)
     positions = ctx_positions[-ctx_pad:].to("cpu")
     pad = ctx_pad - feats.shape[1]
@@ -417,6 +493,7 @@ def run_draft_block(
     ``id + 1``) for positions ``ctx_positions`` ``[L]``, ending right before the
     anchor.
     """
+    _check_context(model, ctx_features, ctx_positions, anchor_id)
     spec = model._spyre_xpress
     ctx_pad, kv_pad, block = spec["ctx_pad"], spec["kv_pad"], model.block_size
     feats, valid_positions, padded_positions = _window(
@@ -427,7 +504,7 @@ def run_draft_block(
 
     ids = torch.full((1, block), model.mask_token_id, dtype=torch.long)
     ids[0, 0] = anchor_id
-    h = F.embedding(ids, model.embed_tokens.weight).to(DEVICE, dtype)
+    h = embed_noise_block(model, ids)  # raw embedding: no multiplier, as trained
 
     block_positions = int(valid_positions[-1]) + 1 + torch.arange(block)
     positions = torch.cat([padded_positions, block_positions])[None]
