@@ -310,7 +310,8 @@ def build_model(
     # Spyre move unties it again, for the device lm_head only).
     model.lm_head.weight = model.embed_tokens.weight
     # Rebuild the rotary after the cast: its buffers were on meta, and a bf16
-    # inv_freq drifts the RoPE angles by radians at positions in the thousands.
+    # inv_freq skews the relative RoPE angles by ~1e-3 rad per position of key
+    # span: negligible at kv_pad 64, radians at the 2048-token training window.
     model.rotary_emb = Qwen3RotaryEmbedding(model.config)
     return model
 

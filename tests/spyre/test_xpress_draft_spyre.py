@@ -71,8 +71,9 @@ def _min_row_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     )
 
 
-# Position 4000 exercises RoPE far from 0, where a reduced-precision inv_freq
-# would drift the rotation angles by radians.
+# pos4000 checks the prebuilt RoPE cache far from position 0. It is not an
+# inv_freq-precision check: attention only sees relative angles, so that error
+# scales with the key span (<= kv_pad here), not the absolute position.
 @pytest.mark.parametrize("start", [0, 4000], ids=["pos0", "pos4000"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("ckpt", XPRESS_PATHS)
@@ -118,9 +119,9 @@ def test_xpress_propose_block(ckpt, dtype, start):
     timings = {}
     for topc in (model.topc, 0):
         module.propose_block(model, feats, positions, ANCHOR_ID, topc=topc)  # warm up
-        start = time.perf_counter()
+        t0 = time.perf_counter()
         draft = module.propose_block(model, feats, positions, ANCHOR_ID, topc=topc)
-        timings[topc] = time.perf_counter() - start
+        timings[topc] = time.perf_counter() - t0
         assert draft.shape == (model.block_size - 1,)
         assert bool(((draft >= 0) & (draft < vocab)).all())
         if topc == 0:
