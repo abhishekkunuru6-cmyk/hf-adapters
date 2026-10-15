@@ -473,6 +473,10 @@ jobs:
           # Piped through env (not interpolated directly into the script) since
           # this is caller-supplied workflow_call input.
           ONLY_MODELS: ${{ inputs.models }}
+          # resolve_test_type.sh only defaults an empty value, so "perf" reaches us
+          # verbatim; matched here rather than via needs: resolve-test-type so matrix
+          # generation does not serialize behind it.
+          RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
           # Standing exclusions live in tests/model_lists/exclude.yaml -- --exclude below is for one-off, dispatch-time excludes only.
           # Example: python .github/scripts/generate_test_matrix.py --exclude ibm-granite/granite-vision-4.1-4b
@@ -481,7 +485,13 @@ jobs:
             read -r -a ONLY_ARGS <<< "$ONLY_MODELS"
             ONLY_ARGS=(--only "${ONLY_ARGS[@]}")
           fi
-          python .github/scripts/generate_test_matrix.py "${ONLY_ARGS[@]}"
+          # Only perf gets --strict-perf: other tiers legitimately pass encoder and
+          # embedding paths, which perf cannot measure.
+          STRICT_ARGS=()
+          if [[ "$RAW_TEST_TYPE" == perf ]]; then
+            STRICT_ARGS=(--strict-perf)
+          fi
+          python .github/scripts/generate_test_matrix.py "${ONLY_ARGS[@]}" "${STRICT_ARGS[@]}"
 
   # ===========================================================================
   # Generates spyre-model-module-tests' matrix from the tests/configs/module_tests/
