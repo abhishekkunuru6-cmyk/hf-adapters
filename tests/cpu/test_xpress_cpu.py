@@ -504,6 +504,8 @@ def test_build_rejects_unsupported_layouts(module):
         {"sample_from_anchor": True},
         {"xpress_block_size": BLOCK * 2},
         {"layer_types": ["sliding_attention"] * 3, "sliding_window": None},
+        {"layer_types": ["sliding_attention", "chunked_attention", "full_attention"]},
+        {"layer_types": ["sliding_attention", "full_attention"]},
     ):
         cfg = _config()
         for k, v in override.items():

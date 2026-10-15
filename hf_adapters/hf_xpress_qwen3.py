@@ -136,6 +136,17 @@ def _validate_config(config: Qwen3Config) -> None:
     if not hasattr(config, "xpress_rank"):
         raise ValueError("Not an XPress checkpoint: missing xpress_rank")
     layer_types = config.layer_types or [FULL] * config.num_hidden_layers
+    if len(layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            f"layer_types has {len(layer_types)} entries for "
+            f"{config.num_hidden_layers} draft layers"
+        )
+    unsupported = sorted(set(layer_types) - {SLIDING, FULL})
+    if unsupported:
+        raise ValueError(
+            f"Unsupported draft layer_types {unsupported}; expected {SLIDING!r} "
+            f"or {FULL!r}"
+        )
     if SLIDING in layer_types and not config.sliding_window:
         raise ValueError("Sliding draft layers need config.sliding_window")
 
