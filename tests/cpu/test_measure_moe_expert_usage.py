@@ -159,3 +159,22 @@ def test_worst_case_slots(usage):
     assert ratios["verify_over_decode_uniform"]["2"] == pytest.approx(
         row.uniform_verify_over_decode
     )
+
+
+def test_truncate_routes_keeps_the_highest_scoring_experts(usage):
+    record = {"prompt_len": 1, "routes": _routes()}
+    (cut,) = usage.truncate_routes([record], 1)
+    assert cut["routes"].tolist() == [[[0], [1], [0], [5]], [[3], [3], [3], [3]]]
+    assert cut["prompt_len"] == 1
+    assert record["routes"].shape[-1] == 2  # input left untouched
+    assert usage.truncate_routes([record], 2)[0]["routes"].shape[-1] == 2
+    for bad in (0, 3):
+        with pytest.raises(ValueError, match="top_k"):
+            usage.truncate_routes([record], bad)
+
+
+def test_decode_ms_for_top_k(usage):
+    model = usage.CostModel(fixed_ms=5.0, per_expert_ms=7.0)
+    # Halving top-8 to top-4 saves 4 expert loads per layer at decode.
+    assert usage.decode_ms_for_top_k(77.0, model, 8, 4) == pytest.approx(49.0)
+    assert usage.decode_ms_for_top_k(77.0, model, 8, 8) == pytest.approx(77.0)

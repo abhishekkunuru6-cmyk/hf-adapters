@@ -154,6 +154,23 @@ def window_means(records: Sequence[dict], k: int) -> list[float]:
     return window_counts(records, k).float().mean(dim=1).tolist()
 
 
+def truncate_routes(records: Sequence[dict], top_k: int) -> list[dict]:
+    """Keep the first ``top_k`` experts per token. The router's ``torch.topk``
+    sorts by score, so this is what a top-``top_k`` router picks (to first order:
+    later layers saw hidden states from the full top-k mixture)."""
+    width = records[0]["routes"].shape[-1] if records else top_k
+    if not 1 <= top_k <= width:
+        raise ValueError(f"top_k must be in [1, {width}], got {top_k}")
+    return [{**r, "routes": r["routes"][..., :top_k]} for r in records]
+
+
+def decode_ms_for_top_k(
+    decode_ms: float, model: "CostModel", trace_top_k: int, top_k: int
+) -> float:
+    """Decode step cost if each token loaded ``top_k`` instead of ``trace_top_k``."""
+    return decode_ms - model.per_expert_ms * (trace_top_k - top_k)
+
+
 def random_distinct(num_experts: int, top_k: int, k: int) -> float:
     """Expected distinct experts if each token picked top_k uniformly at random."""
     return num_experts * (1 - (1 - top_k / num_experts) ** k)
@@ -327,27 +344,33 @@ def run_report(args: argparse.Namespace) -> None:
     import torch
 
     data = torch.load(args.routes, weights_only=True)
-    num_experts, top_k = data["num_experts"], data["top_k"]
+    num_experts, trace_top_k = data["num_experts"], data["top_k"]
+    # The spike measured decode with the trace's (trained) top_k.
     model = CostModel.from_points(
         decode_backbone_ms=args.decode_backbone_ms,
-        decode_experts=top_k,
+        decode_experts=trace_top_k,
         all_backbone_ms=args.all_backbone_ms,
         all_experts=num_experts,
     )
+    top_k = args.top_k or trace_top_k
+    records = truncate_routes(data["records"], top_k)
+    decode_ms = decode_ms_for_top_k(args.decode_ms, model, trace_top_k, top_k)
+    if top_k != trace_top_k:
+        _log(f"top_k {trace_top_k} -> {top_k}: decode {decode_ms:.1f} ms (model)")
     rows = summarize_windows(
-        data["records"],
+        records,
         args.windows,
         num_experts=num_experts,
         top_k=top_k,
         model=model,
         head_ms=args.verify_head_ms,
-        decode_ms=args.decode_ms,
+        decode_ms=decode_ms,
     )
     print(format_table(rows, num_experts))
     print(
         f"\ncost model: backbone = {model.fixed_ms:.1f} + {model.per_expert_ms:.2f} ms"
         f" x E; verify = backbone + {args.verify_head_ms:.1f} ms head; "
-        f"decode = {args.decode_ms:.1f} ms (best case: used-experts-only kernel)"
+        f"decode = {decode_ms:.1f} ms, top_k={top_k} (best case: used-experts-only kernel)"
     )
     if args.out_json:
         Path(args.out_json).write_text(json.dumps(ratios_json(rows), indent=2))
@@ -376,6 +399,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--verify-head-ms", type=float, default=DEFAULT_VERIFY_HEAD_MS)
     report.add_argument("--decode-ms", type=float, default=DEFAULT_DECODE_MS)
+    report.add_argument(
+        "--top-k",
+        type=int,
+        help="re-route with fewer experts per token (default: the trace's top_k)",
+    )
     report.add_argument("--out-json")
     return parser
 
