@@ -271,6 +271,171 @@ def format_table(rows: Sequence[WindowRow], num_experts: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Union cap (SPYRE_MOE_UNION_CAP, PR #721): what a fixed C-slot verify keeps
+# ---------------------------------------------------------------------------
+
+DEFAULT_CAPS = (8, 12, 16, 24, 32, 40, 48)
+P99 = 0.99
+
+
+@dataclass(frozen=True)
+class CapWindowStats:
+    """One k-token window through a C-slot union, per layer ``[L]`` / token ``[L, k]``."""
+
+    union: object  # distinct experts the window routes to
+    kept: object  # of those, how many got a slot
+    dropped_mass: object  # each token's renormalized top-k weight that was dropped
+    kept_per_token: object  # each token's routed experts that kept a slot
+
+
+@dataclass(frozen=True)
+class CapRow:
+    tokens: int
+    cap: int
+    windows: int
+    mean_union: float
+    mean_kept: float
+    mean_dropped_experts: float
+    kept_fraction: float  # mean over (window, layer) of kept / union
+    dropped_mass_mean: float  # over (window, layer, token)
+    dropped_mass_p99: float
+    dropped_mass_max: float
+    fully_kept_fraction: float  # tokens whose whole top-k kept a slot
+    top1_only_fraction: float  # tokens left with only one expert
+    verify_ms: float
+    verify_over_decode: float
+
+
+def _dense_top_k(probs, top_k: int):
+    """Router softmax ``[..., E]`` -> renormalized top-k weights, zeros elsewhere."""
+    import torch
+
+    values, index = probs.topk(top_k, dim=-1)
+    kept = torch.zeros_like(probs).scatter(-1, index, values)
+    return kept / kept.sum(dim=-1, keepdim=True)
+
+
+def union_slot_mask(probs, top_k: int, cap: int):
+    """#721's slot choice for ``probs`` ``[L, T, E]``: bool ``[L, E]``.
+
+    Same rule as ``hf_common.moe_union_pack``: every token's top-1 expert first
+    (ties count as top-1, as ``>= amax`` does there), then the experts with the
+    most renormalized route weight summed over the tokens.
+    """
+    import torch
+
+    tokens, experts = probs.shape[-2:]
+    dense = _dense_top_k(probs, top_k)
+    top1 = (probs >= probs.amax(dim=-1, keepdim=True)).to(dense.dtype)
+    score = top1.amax(dim=-2) + dense.sum(dim=-2) / (tokens + 1)
+    slots = score.topk(min(cap, experts), dim=-1).indices
+    return torch.zeros(score.shape, dtype=torch.bool).scatter(-1, slots, True)
+
+
+def cap_window_stats(probs, top_k: int, cap: int) -> CapWindowStats:
+    """What a ``cap``-slot union keeps of one window ``probs`` ``[L, T, E]``."""
+    tokens = probs.shape[-2]
+    if tokens > cap:
+        raise ValueError(f"union form needs tokens ({tokens}) <= cap ({cap})")
+    dense = _dense_top_k(probs.float(), top_k)
+    slots = union_slot_mask(probs.float(), top_k, cap)
+    routed = dense > 0
+    union = routed.any(dim=-2)
+    kept_routes = routed & slots[:, None, :]
+    return CapWindowStats(
+        union=union.sum(dim=-1),
+        kept=(union & slots).sum(dim=-1),
+        dropped_mass=(1.0 - (dense * slots[:, None, :]).sum(dim=-1)).clamp_min(0.0),
+        kept_per_token=kept_routes.sum(dim=-1),
+    )
+
+
+def _generated_windows(records: Sequence[dict], k: int):
+    """Every k-token window of generated tokens: ``probs`` ``[L, k, E]``."""
+    for record in records:
+        probs, first = record["probs"], int(record["prompt_len"])
+        for start in range(first, probs.shape[1] - k + 1):
+            yield probs[:, start : start + k]
+
+
+def summarize_caps(
+    records: Sequence[dict],
+    windows: Sequence[int],
+    caps: Sequence[int],
+    *,
+    top_k: int,
+    model: CostModel,
+    head_ms: float,
+    decode_ms: float,
+) -> list[CapRow]:
+    """One row per (k, cap); caps below k are skipped (the union form refuses them).
+
+    Verify cost uses ``cap``, not the kept count: the union form reads every slot.
+    """
+    import torch
+
+    rows = []
+    for k in windows:
+        stats_by_cap: dict[int, list[CapWindowStats]] = {c: [] for c in caps if c >= k}
+        for window in _generated_windows(records, k):
+            for cap, stats in stats_by_cap.items():
+                stats.append(cap_window_stats(window, top_k, cap))
+        for cap, stats in stats_by_cap.items():
+            if not stats:
+                raise ValueError(f"no {k}-token windows; continuations are too short")
+            union = torch.stack([s.union for s in stats]).float()
+            kept = torch.stack([s.kept for s in stats]).float()
+            mass = torch.stack([s.dropped_mass for s in stats]).flatten()
+            per_token = torch.stack([s.kept_per_token for s in stats]).flatten()
+            verify_ms = model.backbone_ms(cap) + head_ms
+            rows.append(
+                CapRow(
+                    tokens=k,
+                    cap=cap,
+                    windows=len(stats),
+                    mean_union=float(union.mean()),
+                    mean_kept=float(kept.mean()),
+                    mean_dropped_experts=float((union - kept).mean()),
+                    kept_fraction=float((kept / union).mean()),
+                    dropped_mass_mean=float(mass.mean()),
+                    dropped_mass_p99=float(mass.quantile(P99)),
+                    dropped_mass_max=float(mass.max()),
+                    fully_kept_fraction=float((per_token == top_k).float().mean()),
+                    top1_only_fraction=float((per_token == 1).float().mean()),
+                    verify_ms=verify_ms,
+                    verify_over_decode=verify_ms / decode_ms,
+                )
+            )
+    return rows
+
+
+def format_cap_table(rows: Sequence[CapRow], top_k: int) -> str:
+    header = (
+        f"{'k':>3} {'C':>3} {'windows':>8} {'union':>6} {'kept':>5} {'drop':>5} "
+        f"{'kept %':>7} | {'mass mean':>9} {'p99':>6} {'max':>6} | "
+        f"{'all-k %':>7} {'top1 %':>6} | {'verify ms':>9} {'v/d':>5}"
+    )
+    lines = [header, "-" * len(header)]
+    for r in rows:
+        lines.append(
+            f"{r.tokens:>3} {r.cap:>3} {r.windows:>8} {r.mean_union:>6.1f} "
+            f"{r.mean_kept:>5.1f} {r.mean_dropped_experts:>5.1f} "
+            f"{100 * r.kept_fraction:>6.1f}% | {r.dropped_mass_mean:>9.4f} "
+            f"{r.dropped_mass_p99:>6.3f} {r.dropped_mass_max:>6.3f} | "
+            f"{100 * r.fully_kept_fraction:>6.1f}% {100 * r.top1_only_fraction:>5.1f}% | "
+            f"{r.verify_ms:>9.1f} {r.verify_over_decode:>5.2f}"
+        )
+    lines.append(
+        "union / kept / drop = distinct experts per layer the window routes to / that "
+        "got one of the C slots / that did not. mass = a token's renormalized top-"
+        f"{top_k} weight on dropped experts (#721 renormalizes it away). all-k % = "
+        f"tokens with their whole top-{top_k} kept; top1 % = tokens left with one "
+        "expert. verify ms = cost model at C experts (every slot is read)."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
 
@@ -297,9 +462,12 @@ def run_collect(args: argparse.Namespace) -> None:
     text_config = model.config.get_text_config()
     routers = _find_routers(model)
     captured: list = []
+    captured_probs: list = []
 
     def hook(_module, _inputs, output):
         captured.append(output[2].detach().to(torch.int16).cpu())  # top_k_index
+        if args.save_probs:
+            captured_probs.append(output[0].detach().float().cpu())  # softmax [T, E]
 
     handles = [r.register_forward_hook(hook) for r in routers]
     records = []
@@ -307,18 +475,20 @@ def run_collect(args: argparse.Namespace) -> None:
         for i, record in enumerate(dump["records"]):
             start = time.perf_counter()
             captured.clear()
+            captured_probs.clear()
             with torch.no_grad():
                 model(record["input_ids"][None])
             if len(captured) != len(routers):
                 raise RuntimeError(
                     f"{len(captured)} router calls, {len(routers)} routers"
                 )
-            records.append(
-                {
-                    "prompt_len": int(record["prompt_len"]),
-                    "routes": torch.stack(captured),
-                }
-            )
+            entry = {
+                "prompt_len": int(record["prompt_len"]),
+                "routes": torch.stack(captured),
+            }
+            if args.save_probs:
+                entry["probs"] = torch.stack(captured_probs)  # [L, T, E]
+            records.append(entry)
             _log(
                 f"prompt {i}: {record['input_ids'].numel()} tokens, "
                 f"{time.perf_counter() - start:.0f} s"
@@ -377,6 +547,53 @@ def run_report(args: argparse.Namespace) -> None:
         _log(f"wrote {args.out_json}")
 
 
+def run_cap_report(args: argparse.Namespace) -> None:
+    import torch
+
+    data = torch.load(args.routes, weights_only=True)
+    records = data["records"]
+    if not records or any("probs" not in r for r in records):
+        raise SystemExit(
+            f"{args.routes} has no router probabilities; re-run collect --save-probs"
+        )
+    num_experts, top_k = data["num_experts"], data["top_k"]
+    model = CostModel.from_points(
+        decode_backbone_ms=args.decode_backbone_ms,
+        decode_experts=top_k,
+        all_backbone_ms=args.all_backbone_ms,
+        all_experts=num_experts,
+    )
+    rows = summarize_caps(
+        records,
+        args.windows,
+        args.caps,
+        top_k=top_k,
+        model=model,
+        head_ms=args.verify_head_ms,
+        decode_ms=args.decode_ms,
+    )
+    print(format_cap_table(rows, top_k))
+    print(
+        f"\ncost model: backbone = {model.fixed_ms:.1f} + {model.per_expert_ms:.2f} ms"
+        f" x C; verify = backbone + {args.verify_head_ms:.1f} ms head; "
+        f"decode = {args.decode_ms:.1f} ms"
+    )
+    if args.out_json:
+        Path(args.out_json).write_text(json.dumps([r.__dict__ for r in rows], indent=2))
+        _log(f"wrote {args.out_json}")
+
+
+def _add_cost_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--decode-backbone-ms", type=float, default=DEFAULT_DECODE_BACKBONE_MS
+    )
+    parser.add_argument(
+        "--all-backbone-ms", type=float, default=DEFAULT_ALL_BACKBONE_MS
+    )
+    parser.add_argument("--verify-head-ms", type=float, default=DEFAULT_VERIFY_HEAD_MS)
+    parser.add_argument("--decode-ms", type=float, default=DEFAULT_DECODE_MS)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -387,33 +604,42 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--taps", required=True, help="measure_xpress_acceptance dump")
     collect.add_argument("--target-path", help="default: the dump's target")
     collect.add_argument("--out", required=True)
+    collect.add_argument(
+        "--save-probs",
+        action="store_true",
+        help="also store each router's full softmax (needed by cap-report)",
+    )
 
     report = sub.add_parser("report", help="distinct experts + verify cost per k")
     report.add_argument("--routes", required=True)
     report.add_argument("--windows", type=int, nargs="+", default=list(DEFAULT_WINDOWS))
-    report.add_argument(
-        "--decode-backbone-ms", type=float, default=DEFAULT_DECODE_BACKBONE_MS
-    )
-    report.add_argument(
-        "--all-backbone-ms", type=float, default=DEFAULT_ALL_BACKBONE_MS
-    )
-    report.add_argument("--verify-head-ms", type=float, default=DEFAULT_VERIFY_HEAD_MS)
-    report.add_argument("--decode-ms", type=float, default=DEFAULT_DECODE_MS)
+    _add_cost_args(report)
     report.add_argument(
         "--top-k",
         type=int,
         help="re-route with fewer experts per token (default: the trace's top_k)",
     )
     report.add_argument("--out-json")
+
+    cap = sub.add_parser(
+        "cap-report", help="what SPYRE_MOE_UNION_CAP=C keeps of each k-token verify"
+    )
+    cap.add_argument("--routes", required=True, help="collect --save-probs output")
+    cap.add_argument("--windows", type=int, nargs="+", default=[4, 6, 8, 16])
+    cap.add_argument("--caps", type=int, nargs="+", default=list(DEFAULT_CAPS))
+    _add_cost_args(cap)
+    cap.add_argument("--out-json")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.stage == "collect":
-        run_collect(args)
-    else:
-        run_report(args)
+    stages = {
+        "collect": run_collect,
+        "report": run_report,
+        "cap-report": run_cap_report,
+    }
+    stages[args.stage](args)
 
 
 if __name__ == "__main__":
