@@ -151,6 +151,41 @@ def test_config_grid_and_labels(acc):
         acc.config_grid([6], [512], ["bogus"], [48])
 
 
+def test_chunk_winners_keeps_each_chunks_first_max(acc):
+    # 10 ids in chunks of 4: [0..3], [4..7], [8, 9] (+2 padding).
+    base = torch.tensor([[[1.0, 5.0, 5.0, 0.0, 2.0, 1.0, 3.0, 9.0, 4.0, 4.5]]])
+    values, ids = acc.chunk_winners(base, chunk=4)
+    assert ids.tolist() == [[[1, 7, 9]]]  # first index on the 5.0 tie
+    assert values.tolist() == [[[5.0, 9.0, 4.5]]]
+    assert torch.equal(base.gather(-1, ids), values)
+
+
+def test_chunk_winners_always_hold_the_global_argmax(acc):
+    g = torch.Generator().manual_seed(0)
+    base = torch.randn(1, 15, 1000, generator=g)  # 1000 is not a 64 multiple
+    values, ids = acc.chunk_winners(base)
+    assert ids.shape == (1, 15, 16)
+    assert torch.equal(
+        ids.gather(-1, values.argmax(-1, keepdim=True))[..., 0], base.argmax(-1)
+    )
+
+
+def test_config_grid_with_candidate_rules(acc):
+    grid = acc.config_grid(
+        [6], [512, 4096], ["real"], [1024], candidates=["topc", "chunk"]
+    )
+    # topc is per rule only for "topc"; "chunk" has one config per setting.
+    assert [(c.candidates, c.topc) for c in grid] == [
+        ("topc", 512),
+        ("topc", 4096),
+        ("chunk", 0),
+    ]
+    assert grid[0].label() == "K=6 topc=512 pred=real ctx=1024"
+    assert grid[-1].label() == "K=6 cand=chunk64 pred=real ctx=1024"
+    with pytest.raises(ValueError, match="candidate"):
+        acc.config_grid([6], [512], ["real"], [1024], candidates=["bogus"])
+
+
 def test_config_grid_with_verify_tokens(acc):
     grid = acc.config_grid([6], [512], ["real"], [1024], verify_tokens=[4, 16])
     assert [c.verify_tokens for c in grid] == [4, 16]
@@ -183,13 +218,23 @@ def _tiny_record(seq_len: int = 30, prompt_len: int = 12):
     }
 
 
-@pytest.mark.parametrize("predecessor", ["anchor", "real"])
-def test_measure_record_on_its_own_drafts_accepts_everything(acc, predecessor):
+@pytest.mark.parametrize(
+    "predecessor, candidates", [("anchor", "topc"), ("real", "topc"), ("real", "chunk")]
+)
+def test_measure_record_on_its_own_drafts_accepts_everything(
+    acc, predecessor, candidates
+):
     """A reference built from the drafter's own proposals is fully accepted, so
     the replay, the context slicing and the predecessor wiring line up."""
     from hf_adapters import hf_xpress_qwen3 as xp
 
-    cfg = acc.ProposeConfig(num_passes=2, topc=0, predecessor=predecessor, ctx_pad=16)
+    cfg = acc.ProposeConfig(
+        num_passes=2,
+        topc=0,
+        predecessor=predecessor,
+        ctx_pad=16,
+        candidates=candidates,
+    )
     model = acc.prepare_cpu_drafter(_loaded_drafter(xp), cfg.ctx_pad)
     record = _tiny_record()
     tokens = record["input_ids"].tolist()

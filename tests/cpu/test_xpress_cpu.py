@@ -362,6 +362,29 @@ def test_propose_block_matches_reference(module, topc, num_passes):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("num_passes", [1, 6])
+def test_select_candidates_hook(module, num_passes):
+    """A candidate rule replaces top-C: top-k reproduces ``topc``, and keeping
+    every id reproduces the full-vocab readout (``topc=0``)."""
+    model = _loaded_drafter(module)
+    feats, positions = _context()
+    module.prepare_for_spyre(model, ctx_pad=CTX_PAD)
+    _unwrap_xpress(model)
+    kwargs = dict(anchor_id=7, predecessor_id=11, num_passes=num_passes)
+
+    def propose(**extra):
+        return module.propose_block(model, feats, positions, **kwargs, **extra)
+
+    def keep_all(base):
+        ids = torch.arange(base.shape[-1]).expand(base.shape)
+        return base, ids
+
+    top64 = propose(select_candidates=lambda base: base.topk(64, dim=-1), topc=0)
+    assert torch.equal(top64, propose(topc=64))
+    assert torch.equal(propose(select_candidates=keep_all, topc=0), propose(topc=0))
+
+
+@torch.no_grad()
 def test_refinement_is_not_a_noop(module):
     """Guard against vacuous comparisons: these weights do move the drafts."""
     model = _loaded_drafter(module)

@@ -65,6 +65,10 @@ DEFAULT_DRAFTER = "UIUC-SSAIL/gemma4-26b-a4b-XPress-b16"
 DEFAULT_MAX_NEW_TOKENS = 256
 DEFAULT_TAP_OFFSET = 1  # HF hidden_states[0] is the embedding output
 PREDECESSORS = ("anchor", "real")
+# "topc": the base logits' top-C per slot (paper / #677). "chunk": each
+# CHUNK-id chunk's best token (#721's on-device head reduction).
+CANDIDATE_RULES = ("topc", "chunk")
+CHUNK = 64  # one Spyre stick of fp16
 DEFAULT_PROMPTS = (
     "A store sells pencils at 3 for $0.75 and notebooks at $2.40 each. Maya buys "
     "12 pencils and 5 notebooks and pays with a $20 bill. How much change does "
@@ -92,12 +96,13 @@ class ProposeConfig:
     predecessor: str  # "anchor" (vLLM serving) or "real" (training)
     ctx_pad: int
     verify_tokens: int | None = None  # tokens the target verifies; None = block
+    candidates: str = "topc"  # CANDIDATE_RULES; "chunk" ignores topc
 
     def label(self) -> str:
-        label = (
-            f"K={self.num_passes} topc={self.topc} "
-            f"pred={self.predecessor} ctx={self.ctx_pad}"
+        cand = (
+            f"topc={self.topc}" if self.candidates == "topc" else f"cand=chunk{CHUNK}"
         )
+        label = f"K={self.num_passes} {cand} pred={self.predecessor} ctx={self.ctx_pad}"
         return (
             label if self.verify_tokens is None else f"{label} v={self.verify_tokens}"
         )
@@ -206,16 +211,39 @@ def config_grid(
     predecessors: Sequence[str],
     ctx_pads: Sequence[int],
     verify_tokens: Sequence[int | None] = (None,),
+    candidates: Sequence[str] = ("topc",),
 ) -> list[ProposeConfig]:
     bad = sorted(set(predecessors) - set(PREDECESSORS))
     if bad:
         raise ValueError(f"Unknown predecessor {bad}; choose from {PREDECESSORS}")
+    bad = sorted(set(candidates) - set(CANDIDATE_RULES))
+    if bad:
+        raise ValueError(f"Unknown candidate rule {bad}; choose from {CANDIDATE_RULES}")
+    # (rule, topc) pairs: topc only varies for "topc"; "chunk" ignores it.
+    rules = [(r, c) for r in candidates for c in (topcs if r == "topc" else [0])]
     return [
-        ProposeConfig(k, c, p, w, v)
-        for w, k, c, p, v in itertools.product(
-            ctx_pads, passes, topcs, predecessors, verify_tokens
+        ProposeConfig(k, c, p, w, v, r)
+        for w, k, (r, c), p, v in itertools.product(
+            ctx_pads, passes, rules, predecessors, verify_tokens
         )
     ]
+
+
+def chunk_winners(base, chunk: int = CHUNK):
+    """Each ``chunk``-id chunk's max logit and its first index: ``(values, ids)``.
+
+    ``base`` is ``[..., V]``; a partial last chunk is padded with ``-inf``. The
+    global argmax always survives (it is its chunk's max); a strong token that
+    shares a chunk with a stronger one does not.
+    """
+    import torch
+
+    vocab = base.shape[-1]
+    pad = -vocab % chunk
+    padded = torch.nn.functional.pad(base, (0, pad), value=float("-inf"))
+    values, index = padded.reshape(*base.shape[:-1], -1, chunk).max(dim=-1)
+    offsets = torch.arange(values.shape[-1]) * chunk
+    return values, index + offsets
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +302,7 @@ def propose_at(model, taps, tokens: Sequence[int], anchor: int, cfg: ProposeConf
         predecessor_id=None if predecessor is None else int(predecessor),
         num_passes=cfg.num_passes,
         topc=cfg.topc,
+        select_candidates=chunk_winners if cfg.candidates == "chunk" else None,
     )
     return draft.tolist()
 
@@ -413,7 +442,12 @@ def run_replay(args: argparse.Namespace) -> None:
         raise ValueError("drafter target_layer_ids differ from the dumped taps")
 
     grid = config_grid(
-        args.passes, args.topc, args.predecessor, args.ctx_pad, args.verify_tokens
+        args.passes,
+        args.topc,
+        args.predecessor,
+        args.ctx_pad,
+        args.verify_tokens,
+        args.candidates,
     )
     per_k = None
     if args.verify_cost_json:
@@ -475,6 +509,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--predecessor", nargs="+", choices=PREDECESSORS, default=["anchor"]
     )
     replay.add_argument("--ctx-pad", type=int, nargs="+", default=[48])
+    replay.add_argument(
+        "--candidates",
+        nargs="+",
+        choices=CANDIDATE_RULES,
+        default=["topc"],
+        help=f"per-slot candidates: top-C of the base logits (--topc), or each "
+        f"{CHUNK}-id chunk's best token as in #721 (ignores --topc)",
+    )
     replay.add_argument(
         "--verify-tokens",
         type=int,

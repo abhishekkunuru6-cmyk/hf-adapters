@@ -603,6 +603,9 @@ def propose_block(
     predecessor_id: int | None = None,
     num_passes: int | None = None,
     topc: int | None = None,
+    select_candidates: (
+        Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None
+    ) = None,
 ) -> torch.Tensor:
     """Propose ``block_size - 1`` greedy draft tokens (CPU ``LongTensor``).
 
@@ -610,6 +613,9 @@ def propose_block(
     itself) is the vLLM#54448 serving convention, while training feeds the real
     preceding token. ``num_passes``/``topc`` default to the checkpoint's
     ``xpress_num_passes``/``xpress_topc``; ``topc=0`` scores the full vocab.
+    ``select_candidates(base) -> (values, ids)`` replaces the top-C choice of
+    each slot's candidates (``base`` is the host ``[1, block-1, V]`` logits);
+    ``topc`` is then ignored. Used to compare candidate rules offline.
     """
     passes = model.num_passes if num_passes is None else num_passes
     topc = model.topc if topc is None else topc
@@ -628,8 +634,12 @@ def propose_block(
         return draft[0]
 
     projected = fns["project_hidden"](hidden)
-    if topc:
+    if select_candidates is not None:
+        base, candidates = select_candidates(base)
+        topc = candidates.shape[-1]
+    elif topc:
         base, candidates = base.topk(min(topc, vocab), dim=-1)
+    if topc:
         readout = F.embedding(candidates, head.readout.weight).float()  # [1,S,C,r]
     prefix = torch.tensor(
         [[anchor_id if predecessor_id is None else predecessor_id, anchor_id]]
