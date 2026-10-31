@@ -154,3 +154,105 @@ def test_run_config_on_a_tiny_model(bench, monkeypatch):
     assert row.status == "ok" and row.requests == 4 and row.match_ar == 1.0
     assert row.rows == 8 and row.covers_top1 and row.tokens_per_step >= 1.0
     assert args.tree_drafters["chain4"] is tree_drafter
+
+
+# -- plain (non-speculative) batched decoding baseline ---------------------------
+
+
+def test_left_pad(bench):
+    ids, mask = bench.left_pad([torch.tensor([5, 6, 7]), torch.tensor([9])])
+    assert ids.tolist() == [[5, 6, 7], [0, 0, 9]]
+    assert mask.tolist() == [[1, 1, 1], [0, 0, 1]]
+
+
+def test_summarize_plain(bench):
+    # Two batch-4 groups, 9 decode steps each (10 tokens: the first is prefill).
+    row = bench.summarize_plain(4, 16, [900.0, 1100.0], steps=9)
+    assert row.shape == "plain" and row.width == 1 and row.rows == 4
+    assert row.covers_top1 and row.tokens_per_step == 1.0
+    assert row.verify_ms == pytest.approx(1000 / 9, abs=0.01)  # median step
+    assert row.draft_ms == 0.0 and row.steps == 18 and row.requests == 8
+    assert row.tokens_per_s == pytest.approx(1000 * 4 * 18 / 2000, abs=0.01)
+    assert row.verify_tokens_per_s == row.tokens_per_s
+    assert not bench.summarize_plain(32, 16, [1.0], steps=1).covers_top1
+
+
+def test_run_plain_config_times_decode_without_prefill(bench):
+    """generate(N) - generate(1) per group, after one warmup, EOS off."""
+    calls = []
+
+    class Target:
+        def generate(self, ids, **kw):
+            calls.append((ids.shape[0], kw))
+            clock.now += 0.5 + 0.01 * kw["max_new_tokens"]  # prefill + decode
+            return torch.zeros(ids.shape[0], ids.shape[1] + kw["max_new_tokens"])
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    caps = []
+    bsd = types.SimpleNamespace(
+        configure_union_cap=lambda model, cap: caps.append(cap), _clock=clock
+    )
+    prompts = [torch.arange(n) + 1 for n in (3, 5, 4, 6)]
+    args = types.SimpleNamespace(max_new_tokens=11)
+    row = bench.run_plain_config(bsd, Target(), 2, 32, prompts, args)
+    assert caps == [32]
+    # warmup (N, 1) + two groups x (N, 1)
+    assert [kw["max_new_tokens"] for _, kw in calls] == [11, 1, 11, 1, 11, 1]
+    assert all(b == 2 for b, _ in calls)
+    assert all(kw["min_new_tokens"] == kw["max_new_tokens"] for _, kw in calls)
+    assert all(
+        kw["eos_token_id"] is None and kw["do_sample"] is False for _, kw in calls
+    )
+    assert all(kw["attention_mask"].shape[0] == 2 for _, kw in calls)
+    # each group: (0.5 + 0.11) - (0.5 + 0.01) = 0.1 s for 10 decode steps
+    assert row.verify_ms == pytest.approx(10.0, abs=1e-6)
+    assert row.tokens_per_s == pytest.approx(2 * 10 / 0.1, abs=1e-3)
+    assert row.requests == 4 and row.steps == 20
+
+
+@pytest.mark.parametrize("cap", [None, 16], ids=["cap-off", "cap-16"])
+def test_run_plain_config_on_the_adapter_generate(bench, monkeypatch, cap):
+    """The real batched adapter ``generate`` accepts the baseline's arguments, and
+    its left-padded batch decodes each prompt as plain greedy does."""
+    import functools
+
+    pytest.importorskip("hf_adapters._gemma4_tree")
+    helpers = pytest.importorskip("tests._gemma4_tree_helpers")
+    from hf_adapters import hf_common, hf_gemma4_moe
+
+    reference, adapted = helpers.tiny_gemma4_moe(monkeypatch)
+    helpers._unwrap(adapted)
+    generate = functools.partial(
+        hf_common.generate,
+        hf_gemma4_moe._run_forward,
+        adapted,
+        prefill_backbone_fn=hf_gemma4_moe._run_backbone_forward,
+    )
+    outputs = []
+
+    def recording(ids, **kw):
+        out = generate(ids, **kw)
+        outputs.append((ids, out))
+        return out
+
+    monkeypatch.setattr(adapted, "generate", recording, raising=False)
+    bsd = _load("batched_spec_decode")
+    g = torch.Generator().manual_seed(6)
+    prompts = [torch.randint(0, 320, (n,), generator=g) for n in (18, 27)]
+    args = types.SimpleNamespace(max_new_tokens=6)
+    row = bench.run_plain_config(bsd, adapted, 2, cap, prompts, args)
+    assert row.status == "ok" and row.rows == 2 and row.steps == 5
+    ids, out = outputs[-2]  # the measured N-token run
+    assert out.shape == (2, ids.shape[1] + 6)
+    if cap is None:  # exact: each row equals HF greedy on its own prompt
+        for b, p in enumerate(prompts):
+            want = reference.generate(
+                p[None], max_new_tokens=6, min_new_tokens=6, do_sample=False
+            )[0, p.numel() :]
+            assert out[b, ids.shape[1] :].tolist() == want.tolist()

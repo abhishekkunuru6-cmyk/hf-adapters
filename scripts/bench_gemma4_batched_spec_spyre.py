@@ -28,6 +28,11 @@ then every group of ``batch`` prompts is measured.
   ``verify tok/s`` counts verify time only (the target's ceiling).
 - ``match_ar`` is the share of requests whose output equals the plain greedy
   ``generate`` of the same prompt (``--compare-ar``).
+- Shape ``plain`` is the baseline without speculation: the adapter's own
+  batched ``generate`` (1 token per request per step, ``rows`` = batch). Its
+  decode time is ``generate(N) - generate(1)`` per group, so prefill is left
+  out; EOS is off, so every request decodes exactly N tokens. With a cap set,
+  a batch of 2..cap rows takes #721's union path in plain decode too.
 
 Usage (Spyre pod, #721's checkout on PYTHONPATH; start small, compiles are
 per configuration)::
@@ -36,6 +41,9 @@ per configuration)::
         python scripts/bench_gemma4_batched_spec_spyre.py \\
         --shapes tree16 chain8 --batch-sizes 1 4 --caps 16 32 \\
         --compare-ar --output batched.json
+
+    # baseline only
+    ... --shapes plain --batch-sizes 1 2 4 8 --caps off 16 32 64
 """
 
 import argparse
@@ -50,6 +58,7 @@ from pathlib import Path
 DEFAULT_BATCHES = (1, 2, 4, 8)
 DEFAULT_CAPS = ("off", "16", "32", "64", "128")
 DEFAULT_SHAPES = ("tree16", "chain8", "chain16")
+PLAIN = "plain"  # non-speculative batched decoding baseline
 
 # Distinct tasks, so a batch's requests route to different experts.
 DEFAULT_PROMPTS = (
@@ -159,6 +168,41 @@ def summarize(shape, width, batch, cap, runs, matches=None, diffs=None):
     )
 
 
+def left_pad(prompts):
+    """Left-padded ``(input_ids, attention_mask)`` ``[B, longest]`` of 1-D prompts."""
+    import torch
+
+    longest = max(int(p.numel()) for p in prompts)
+    ids = torch.zeros(len(prompts), longest, dtype=torch.long)
+    mask = torch.zeros(len(prompts), longest, dtype=torch.long)
+    for b, p in enumerate(prompts):
+        ids[b, longest - p.numel() :] = p
+        mask[b, longest - p.numel() :] = 1
+    return ids, mask
+
+
+def summarize_plain(batch, cap, decode_ms, *, steps):
+    """A ``Row`` for plain decoding: ``decode_ms`` per group of ``steps`` steps."""
+    step_ms = [ms / steps for ms in decode_ms]
+    tokens = batch * steps * len(decode_ms)
+    tps = round(1000 * tokens / max(sum(decode_ms), 1e-9), 2)
+    return Row(
+        shape=PLAIN,
+        width=1,
+        batch=batch,
+        cap="off" if cap is None else str(cap),
+        status="ok",
+        rows=batch,
+        covers_top1=cap is None or batch <= cap,
+        tokens_per_step=1.0,
+        verify_ms=round(statistics.median(step_ms), 2),
+        tokens_per_s=tps,
+        verify_tokens_per_s=tps,
+        steps=steps * len(decode_ms),
+        requests=batch * len(decode_ms),
+    )
+
+
 def failed(shape, width, batch, cap, error):
     rows = batch * width
     return Row(
@@ -264,6 +308,31 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
     )
 
 
+def run_plain_config(bsd, target, batch, cap, prompts, args):
+    """Plain batched greedy decoding: decode ms = generate(N) - generate(1)."""
+    bsd.configure_union_cap(target, cap)
+    n = args.max_new_tokens
+    groups = prompt_groups(list(range(len(prompts))), batch)
+
+    def timed(group, tokens):
+        ids, mask = left_pad([prompts[i] for i in group])
+        t0 = bsd._clock()
+        target.generate(
+            ids,
+            attention_mask=mask,
+            max_new_tokens=tokens,
+            min_new_tokens=tokens,
+            do_sample=False,
+            eos_token_id=None,
+        )
+        return 1000 * (bsd._clock() - t0)
+
+    timed(groups[0], n)  # warmup: compiles prefill and decode for this batch
+    timed(groups[0], 1)
+    decode_ms = [timed(g, n) - timed(g, 1) for g in groups]
+    return summarize_plain(batch, cap, decode_ms, steps=n - 1)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--model", default="google/gemma-4-26B-A4B-it")
@@ -285,9 +354,12 @@ def main():
     from hf_adapters import AutoSpyreModelForCausalLM, hf_xpress_qwen3
 
     bsd = _sibling("batched_spec_decode")
-    unknown = set(args.shapes) - set(bsd.SHAPES)
+    known = set(bsd.SHAPES) | {PLAIN}
+    unknown = set(args.shapes) - known
     if unknown:
-        p.error(f"unknown shapes {sorted(unknown)}; choose from {sorted(bsd.SHAPES)}")
+        p.error(f"unknown shapes {sorted(unknown)}; choose from {sorted(known)}")
+    if args.max_new_tokens < 2:
+        p.error("--max-new-tokens must be at least 2")
     _raise_recompile_limit()
     tok = AutoTokenizer.from_pretrained(args.model)
     args.eos = tok.eos_token_id
@@ -315,14 +387,17 @@ def main():
             for batch in args.batch_sizes:
                 t = time.time()
                 try:
-                    row = run_config(
-                        bsd, target, drafter, shape, batch, cap, prompts, refs, args
-                    )
+                    if shape == PLAIN:
+                        row = run_plain_config(bsd, target, batch, cap, prompts, args)
+                    else:
+                        row = run_config(
+                            bsd, target, drafter, shape, batch, cap, prompts, refs, args
+                        )
                 except Exception as e:  # a failed compile must not end the sweep
                     first = (str(e).strip().splitlines() or [""])[0]
                     row = failed(
                         shape,
-                        bsd.SHAPES[shape]["width"],
+                        1 if shape == PLAIN else bsd.SHAPES[shape]["width"],
                         batch,
                         cap,
                         f"{type(e).__name__}: {first}",
