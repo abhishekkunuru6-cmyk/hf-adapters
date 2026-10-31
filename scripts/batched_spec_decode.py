@@ -35,11 +35,19 @@ verify forward per step, reusing #721's per-layer verify graphs
 - **One drafter, per-request state.** The drafter's request state (its
   context KV cache) is swapped per request; drafting runs one request at a
   time, so ``draft_ms`` is the sum over the batch, not a batched draft.
+- **Beam chains** (``search="beam"``): the drafter's one forward is searched
+  with a beam on the host, and only the path with the largest expected
+  accepted length is verified, as a chain.
+- **Greedy ids on the device** (``device_argmax``): instead of copying
+  ``[B, width, vocab]`` logits to the host, the verify reduces them to each
+  64-column chunk's max and first index (the XPress head's trick), and the
+  host picks the winning chunk. ``readback_ms`` times this part of a verify.
 
 With greedy acceptance against the verify's own predictions, each request's
 output is its greedy continuation (as in #721) when the cap is off.
 """
 
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -71,7 +79,14 @@ SHAPES = {
     "tree16": dict(width=16, frontier=4, branching=4, depth=7),
     "chain8": dict(width=8, frontier=1, branching=1, depth=7),
     "chain16": dict(width=16, frontier=1, branching=1, depth=15),
+    "chain4": dict(width=4, frontier=1, branching=1, depth=3),
+    "chain6": dict(width=6, frontier=1, branching=1, depth=5),
+    # A beam of 4 x branching 4 in the draft; one chain of 8 to verify.
+    "chain8-beam": dict(width=8, frontier=4, branching=4, depth=7, search="beam"),
 }
+
+CHUNK = 64  # columns per argmax chunk (one stick)
+ARGMAX_SLICE = 512 * CHUNK  # columns per reduction slice (see _xpress_tree)
 
 # XPressTreeDrafter's per-request attributes (set by reset/append/draft).
 DRAFTER_STATE = ("capacity", "keys", "values", "block_index", "rows", "last_row")
@@ -137,6 +152,81 @@ def pad_tree(tokens, parents, width):
     return tokens, parents
 
 
+def propose_chain_beam(
+    drafter, anchor, predecessor, *, depth, beam, branching, new_features=None
+):
+    """One chain ``(tokens, parents)`` from a beam search over one draft forward.
+
+    Uses the ``XPressTreeDrafter``'s own path-conditioned slot scores. Every
+    path the beam reaches is a candidate; the one with the largest expected
+    accepted length ``sum_k P(first k tokens)`` is returned (ties: the first
+    found). The greedy chain always stays in the beam (a plain beam can prune
+    it), so the result is never worse than the greedy chain by this measure.
+    With ``beam = branching = 1`` this is the drafter's greedy chain.
+    """
+    d = drafter
+    cmax, first, hidden = d.draft(anchor, new_features)
+    cand_ids, cand_vals = d._candidates(cmax, first)
+    summary = hidden.mean(dim=0, keepdim=True) @ d.r_summary.T
+    hidden_part = hidden @ d.r_hidden.T + summary
+    beams = [((int(predecessor), int(anchor)), 0.0, 0.0)]  # path, log-prob, E
+    best = greedy = beams[0]
+    for k in range(1, min(depth, d.block - 1) + 1):
+        prevs = torch.tensor([path for path, _, _ in beams], dtype=torch.long)
+        logp = d._slot_logprobs(hidden_part, prevs, k, cand_ids, cand_vals)
+        values, index = logp.topk(min(branching, logp.shape[-1]), dim=-1)
+        grown, next_greedy = [], None
+        for lane, (path, score, expected) in enumerate(beams):
+            for j in range(values.shape[-1]):
+                s = score + float(values[lane, j])
+                token = int(cand_ids[k, int(index[lane, j])])
+                grown.append((path + (token,), s, expected + math.exp(s)))
+                if path == greedy[0] and j == 0:
+                    next_greedy = grown[-1]
+        for node in grown:
+            if node[2] > best[2]:
+                best = node
+        greedy = next_greedy
+        beams = sorted(grown, key=lambda node: -node[1])[:beam]
+        if greedy not in beams:
+            beams[-1] = greedy
+    tokens = list(best[0][1:])
+    return tokens, list(range(-1, len(tokens) - 1))
+
+
+def vocab_bias(vocab, padded, dtype):
+    """``[padded]`` additive bias: 0 on real columns, -1e4 on padding."""
+    bias = torch.zeros(padded, dtype=dtype)
+    bias[vocab:] = -1e4
+    return bias
+
+
+def chunk_argmax_stats(logits, bias, positions, slice_cols):
+    """``[B, T, V]`` logits -> ``[B*T, 2*V/64]``: each chunk's max, then first index.
+
+    Reduced in slices of ``slice_cols`` columns, as the XPress head does on
+    Spyre. Indices are exact small integers in fp16.
+    """
+    rows = logits.shape[0] * logits.shape[1]
+    flat = logits.reshape(rows, -1) + bias
+    maxima, firsts = [], []
+    for s in range(0, flat.shape[-1], slice_cols):
+        grouped = flat[:, s : s + slice_cols].reshape(rows, -1, CHUNK)
+        cmax = grouped.amax(dim=-1, keepdim=True)
+        hit = (grouped == cmax).to(flat.dtype)
+        first = hit * positions + (1 - hit) * float(CHUNK)
+        maxima.append(cmax[..., 0])
+        firsts.append(first.amin(dim=-1))
+    return torch.cat([*maxima, *firsts], dim=-1)
+
+
+def decode_chunk_argmax(stats, chunks):
+    """Host ``[rows, 2*chunks]`` stats -> ``[rows]`` argmax (first maximum)."""
+    cmax, first = stats[:, :chunks], stats[:, chunks:]
+    best = cmax.argmax(dim=-1)
+    return best * CHUNK + first.gather(-1, best[:, None])[:, 0].round().long()
+
+
 def _host(t):
     # Copy in the device dtype, then cast on the host: a materialized
     # fp16 -> fp32 cast on Spyre permutes lanes (see hf_xpress_qwen3).
@@ -161,7 +251,9 @@ class BatchState:
 class BatchedTreeVerifier:
     """Prefill, verify and commit for ``B`` requests on a prepared MoE model."""
 
-    def __init__(self, model, width, *, tap_layers=(), prefill_chunk=512):
+    def __init__(
+        self, model, width, *, tap_layers=(), prefill_chunk=512, device_argmax=False
+    ):
         cfg = text_config(model.config)
         if not getattr(cfg, "enable_moe_block", False):
             raise ValueError("BatchedTreeVerifier drives the Gemma 4 MoE adapter")
@@ -177,6 +269,9 @@ class BatchedTreeVerifier:
         self.blocks = list(_backbone(model).layers)
         for i, block in enumerate(self.blocks):
             block.enable_tree_verify(tap=i in self.tap_layers)
+        self.vocab_size = int(cfg.vocab_size)
+        self.device_argmax = bool(device_argmax)
+        self._argmax = None  # (compiled stats fn, bias, positions), built lazily
         self.state = None
 
     @torch.no_grad()
@@ -321,6 +416,23 @@ class BatchedTreeVerifier:
         st.pending = True
         return hf_common.run_lm_head(self.model, _final_norm(self.model, h))
 
+    def greedy_ids(self, logits):
+        """Host ``[B, T]`` argmax over the real vocabulary of verify ``logits``."""
+        B, T, padded = logits.shape
+        if not self.device_argmax:
+            return _host(logits[:, :, : self.vocab_size]).argmax(-1)
+        if padded % CHUNK:
+            raise ValueError(f"padded vocabulary {padded} is not a multiple of {CHUNK}")
+        if self._argmax is None or self._argmax[1].shape[0] != padded:
+            device = logits.device
+            bias = vocab_bias(self.vocab_size, padded, logits.dtype).to(device)
+            positions = torch.arange(CHUNK, dtype=logits.dtype).to(device)
+            fn = torch.compile(chunk_argmax_stats, dynamic=False, fullgraph=True)
+            self._argmax = (fn, bias, positions)
+        fn, bias, positions = self._argmax
+        stats = _host(fn(logits, bias, positions, ARGMAX_SLICE))
+        return decode_chunk_argmax(stats, padded // CHUNK).view(B, T)
+
     def tap_features(self):
         """``[B, width, taps * H]`` host tap rows of the last verify (node order)."""
         rows = [_host(self.blocks[i].tree_tap) for i in self.tap_layers]
@@ -381,7 +493,8 @@ class BatchStats:
     batch: int
     prefill_ms: float = 0.0
     draft_ms: list = field(default_factory=list)  # whole batch, sequential
-    verify_ms: list = field(default_factory=list)
+    verify_ms: list = field(default_factory=list)  # forward + readback
+    readback_ms: list = field(default_factory=list)  # logits -> host greedy ids
     host_ms: list = field(default_factory=list)  # accept + commit + taps
     accepted: list = field(default_factory=list)  # [step][request] or None
 
@@ -415,12 +528,16 @@ class BatchedSpecDecoder:
         tree_drafter=None,
         draft_vocab=None,
         drafter_kwargs=None,
+        device_argmax=False,
     ):
         """``tree_drafter``: a prebuilt ``XPressTreeDrafter`` for ``shape`` to reuse
         (keeps its compiled graphs across verifier rebuilds)."""
         self.width = int(shape["width"])
+        self.shape = dict(shape)
         self.taps = tuple(drafter.target_layer_ids)
-        self.verifier = BatchedTreeVerifier(target, self.width, tap_layers=self.taps)
+        self.verifier = BatchedTreeVerifier(
+            target, self.width, tap_layers=self.taps, device_argmax=device_argmax
+        )
         if tree_drafter is None:
             tree_drafter = XPressTreeDrafter(
                 drafter,
@@ -434,6 +551,20 @@ class BatchedSpecDecoder:
         self.slots = DrafterSlots(tree_drafter)
         self.vocab_size = int(text_config(target.config).vocab_size)
         self.stats = None
+
+    def _propose(self, drafter, anchor, predecessor, new_rows):
+        shape = self.shape
+        if shape.get("search") == "beam":
+            return propose_chain_beam(
+                drafter,
+                anchor,
+                predecessor,
+                depth=shape["depth"],
+                beam=shape["frontier"],
+                branching=shape["branching"],
+                new_features=new_rows,
+            )
+        return drafter.propose(anchor, predecessor, self.width, new_rows)
 
     @torch.no_grad()
     def generate(self, prompts, max_new_tokens, *, max_steps=None, eos_token_id=None):
@@ -473,11 +604,12 @@ class BatchedSpecDecoder:
                     continue
                 pred = outs[b][-2] if len(outs[b]) > 1 else prompt_last[b]
                 with self.slots.use(b) as d:
-                    tokens, parents = d.propose(outs[b][-1], pred, w, new_rows[b])
+                    tokens, parents = self._propose(d, outs[b][-1], pred, new_rows[b])
                 trees.append(pad_tree(tokens, parents, w))
             t1 = _clock()
             logits = v.verify(trees)
-            predictions = _host(logits[:, :, : self.vocab_size]).argmax(-1).tolist()
+            t_forward = _clock()
+            predictions = v.greedy_ids(logits).tolist()
             t2 = _clock()
             features = v.tap_features()
             paths, step = [], []
@@ -499,6 +631,7 @@ class BatchedSpecDecoder:
             t3 = _clock()
             stats.draft_ms.append(1000 * (t1 - t0))
             stats.verify_ms.append(1000 * (t2 - t1))
+            stats.readback_ms.append(1000 * (t2 - t_forward))
             stats.host_ms.append(1000 * (t3 - t2))
             stats.accepted.append(step)
         return [o[:max_new_tokens] for o in outs]

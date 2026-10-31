@@ -47,8 +47,9 @@ def test_median(prof):
     [
         dict(width=8, frontier=3, branching=3, depth=5),
         dict(width=8, frontier=1, branching=1, depth=7),
+        dict(width=8, frontier=4, branching=4, depth=7, search="beam"),
     ],
-    ids=["tree8", "chain8"],
+    ids=["tree8", "chain8", "chain8-beam"],
 )
 def test_profile_shape_splits_forward_and_search(prof, shape, monkeypatch):
     from tests.cpu.test_gemma4_spec_decode import _drafter
@@ -81,3 +82,36 @@ def test_profile_shape_splits_forward_and_search(prof, shape, monkeypatch):
         result["forward_ms"] + result["search_ms"], rel=0.5
     )
     assert "draft" not in vars(result["drafter"])  # instance patch removed
+
+
+def test_search_breakdown(prof, monkeypatch):
+    from tests.cpu.test_gemma4_spec_decode import _drafter
+
+    from hf_adapters import _xpress_tree
+
+    monkeypatch.setattr(_xpress_tree.torch, "compile", lambda fn, **_: fn)
+    d = prof.profile_shape(
+        _drafter(),
+        dict(width=8, frontier=1, branching=1, depth=7),
+        steps=2,
+        warmup=1,
+        context=40,
+        accepted=3,
+        drafter_kwargs=dict(dtype=torch.float32, device="cpu", compile=False),
+    )["drafter"]
+    cmax, first, hidden = d.draft(17)
+    threads = torch.get_num_threads()
+    rows = prof.search_breakdown(
+        d, cmax, first, hidden, anchor=17, predecessor=5, depth=7, threads=[0, 1]
+    )
+    assert torch.get_num_threads() == threads  # restored
+    assert [r["threads"] for r in rows] == [threads, 1]
+    for r in rows:
+        for key in ("candidates_ms", "gather_ms", "level_ms", "chain_search_ms"):
+            assert r[key] > 0, key
+        assert 1 <= r["survivors"] <= r["candidates"] == d.chunks
+    assert "draft" not in vars(d)  # the cached-draft patch is removed
+    table = prof.format_breakdown(rows)
+    assert (
+        table.splitlines()[0].startswith("| threads |") and len(table.splitlines()) == 4
+    )

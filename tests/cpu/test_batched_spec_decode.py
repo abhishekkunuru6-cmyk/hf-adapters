@@ -22,6 +22,7 @@ prompt's greedy continuation. Skipped without #721's modules.
 """
 
 import importlib.util
+import math
 from pathlib import Path
 
 import pytest
@@ -249,3 +250,141 @@ def test_drafter_cache_size_does_not_follow_the_prompt_length(bsd, models, monke
         decoder.generate(_prompts(*lengths), max_new_tokens=6)
         sizes.append({s["capacity"] for s in decoder.slots.states})
     assert sizes[0] == sizes[1] and len(sizes[0]) == 1
+
+
+# -- round 1: chain length, beam chain, device argmax, readback timing ---------
+
+
+def test_new_shapes(bsd):
+    assert bsd.SHAPES["chain4"] == dict(width=4, frontier=1, branching=1, depth=3)
+    assert bsd.SHAPES["chain6"] == dict(width=6, frontier=1, branching=1, depth=5)
+    beam = bsd.SHAPES["chain8-beam"]
+    assert beam["width"] == 8 and beam["depth"] == 7 and beam["search"] == "beam"
+
+
+def test_chunk_argmax_matches_argmax_with_ties_and_padding(bsd):
+    g = torch.Generator().manual_seed(0)
+    vocab, padded = 300, 448  # 7 chunks of 64; columns >= 300 are padding
+    logits = torch.randn(2, 3, padded, generator=g).half()
+    logits[0, 0, 10] = logits[0, 0, 200] = 9.0  # tie across chunks: first wins
+    logits[0, 1, 70] = logits[0, 1, 75] = 9.0  # tie inside a chunk
+    logits[1, 2, 350] = 50.0  # a padded column must never win
+    bias = bsd.vocab_bias(vocab, padded, torch.float16)
+    positions = torch.arange(bsd.CHUNK, dtype=torch.float16)
+    for slice_cols in (128, 448, 4096):  # several slices, one, larger than the row
+        stats = bsd.chunk_argmax_stats(logits, bias, positions, slice_cols)
+        ids = bsd.decode_chunk_argmax(stats.float(), padded // bsd.CHUNK)
+        want = logits[:, :, :vocab].float().argmax(-1).flatten()
+        assert ids.tolist() == want.tolist()
+    assert ids[0] == 10 and ids[1] == 70
+
+
+def test_greedy_ids_on_the_device_equals_the_host(bsd, models):
+    _, adapted = models
+    bsd.configure_union_cap(adapted, None)
+    host = bsd.BatchedTreeVerifier(adapted, 8, prefill_chunk=64)
+    dev = bsd.BatchedTreeVerifier(adapted, 8, prefill_chunk=64, device_argmax=True)
+    prompts = _prompts(20, 31, seed=8)
+    host.prefill(prompts, max_steps=2)
+    tree = (list(range(8)), [-1, 0, 1, 2, 3, 4, 5, 6])
+    logits = host.verify([tree, tree])
+    assert dev.greedy_ids(logits).tolist() == host.greedy_ids(logits).tolist()
+    assert host.greedy_ids(logits).shape == (2, 8)
+
+
+def _drafter_pair(seed=0):
+    from tests.cpu.test_gemma4_spec_decode import _drafter
+
+    model = _drafter(seed)
+    kw = dict(dtype=torch.float32, device="cpu", compile=False)
+    return model, kw
+
+
+def _primed(model, kw, options, features):
+    d = _xpress_tree.XPressTreeDrafter(model, **options, **kw)
+    d.reset(200)
+    d.append(features)
+    return d
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_beam_chain_with_beam_one_is_the_greedy_chain(bsd, monkeypatch, seed):
+    monkeypatch.setattr(_xpress_tree.torch, "compile", lambda fn, **_: fn)
+    model, kw = _drafter_pair(seed)
+    g = torch.Generator().manual_seed(seed)
+    width = len(model.target_layer_ids) * model.config.hidden_size
+    ctx, new = torch.randn(30, width, generator=g), torch.randn(3, width, generator=g)
+    chain = dict(frontier=1, branching=1, depth=7)
+    a = _primed(model, kw, chain, ctx)
+    b = _primed(model, kw, chain, ctx)
+    want = a.propose(17, 5, 8, new_features=new)
+    got = bsd.propose_chain_beam(
+        b, 17, 5, depth=7, beam=1, branching=1, new_features=new
+    )
+    assert got == want
+    assert got[1] == [-1, 0, 1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_beam_chain_maximizes_expected_accepted_length(bsd, monkeypatch, seed):
+    monkeypatch.setattr(_xpress_tree.torch, "compile", lambda fn, **_: fn)
+    model, kw = _drafter_pair(seed)
+    g = torch.Generator().manual_seed(10 + seed)
+    width = len(model.target_layer_ids) * model.config.hidden_size
+    ctx, new = torch.randn(30, width, generator=g), torch.randn(3, width, generator=g)
+    chain = dict(frontier=1, branching=1, depth=7)
+    greedy = _primed(model, kw, chain, ctx).propose(17, 5, 8, new_features=new)[0]
+    beam, parents = bsd.propose_chain_beam(
+        _primed(model, kw, chain, ctx),
+        17,
+        5,
+        depth=7,
+        beam=4,
+        branching=4,
+        new_features=new,
+    )
+    assert parents == list(range(-1, len(beam) - 1)) and beam[0] == 17
+    ref = _primed(model, kw, chain, ctx)
+    cmax, first, hidden = ref.draft(17, new)
+
+    def expected(tokens):  # sum over prefixes of P(prefix), from #721's reference
+        return sum(
+            math.exp(
+                _xpress_tree.path_logprob(
+                    ref, hidden, cmax, first, 5, 17, tokens[1 : k + 1]
+                )
+            )
+            for k in range(1, len(tokens))
+        )
+
+    assert expected(beam) >= expected(greedy) - 1e-6
+
+
+@pytest.mark.parametrize("shape", ["chain4", "chain8-beam"])
+def test_new_shapes_decode_greedy(bsd, models, monkeypatch, shape):
+    from tests.cpu.test_gemma4_spec_decode import _drafter
+
+    reference, adapted = models
+    bsd.configure_union_cap(adapted, None)
+    monkeypatch.setattr(_xpress_tree.torch, "compile", lambda fn, **_: fn)
+    spec = dict(bsd.SHAPES[shape])
+    if spec.get("search") == "beam":
+        spec["depth"] = 7  # the tiny drafter's block is 8
+    prompts = _prompts(25, 38, seed=9)
+    decoder = bsd.BatchedSpecDecoder(
+        adapted,
+        _drafter(),
+        spec,
+        device_argmax=True,
+        drafter_kwargs=dict(dtype=torch.float32, device="cpu", compile=False),
+    )
+    outs = decoder.generate(prompts, max_new_tokens=20)
+    for prompt, out in zip(prompts, outs):
+        with torch.no_grad():
+            greedy = reference.generate(
+                prompt[None], max_new_tokens=20, do_sample=False, min_new_tokens=20
+            )[0, prompt.numel() :]
+        assert out == greedy.tolist()
+    stats = decoder.stats
+    assert len(stats.readback_ms) == stats.steps()
+    assert all(r <= v for r, v in zip(stats.readback_ms, stats.verify_ms))

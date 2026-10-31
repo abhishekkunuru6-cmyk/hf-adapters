@@ -37,9 +37,14 @@ def bench():
     return _load("bench_gemma4_batched_spec_spyre")
 
 
-def _stats(batch, accepted, verify, draft, host):
+def _stats(batch, accepted, verify, draft, host, readback=None):
     s = types.SimpleNamespace(
-        batch=batch, accepted=accepted, verify_ms=verify, draft_ms=draft, host_ms=host
+        batch=batch,
+        accepted=accepted,
+        verify_ms=verify,
+        draft_ms=draft,
+        host_ms=host,
+        readback_ms=readback if readback is not None else [0.0] * len(verify),
     )
     s.emitted = lambda: [a for step in accepted for a in step if a is not None]
     s.steps = lambda: len(accepted)
@@ -86,6 +91,24 @@ def test_summarize_counts_tokens_per_request_and_time(bench):
     assert row.verify_tokens_per_s == pytest.approx(1000 * 19 / 330, abs=0.01)
     assert row.steps == 3 and row.requests == 4
     assert row.match_ar == 0.75 and row.median_first_diff == 7
+    assert row.tokens_per_row == pytest.approx(19 / 5 / 8, abs=1e-3)
+    assert row.active_share == pytest.approx(5 / 6, abs=1e-3)  # one None of 6
+
+
+def test_summarize_diagnostics(bench):
+    # step totals 100, 100, 100, 500: one step above 2x the median
+    run = _stats(
+        1,
+        [[2], [2], [2], [2]],
+        [80.0, 80.0, 80.0, 480.0],
+        [10.0] * 4,
+        [10.0] * 4,
+        readback=[5.0, 6.0, 7.0, 8.0],
+    )
+    row = bench.summarize("chain8", 8, 1, 16, [run], compiles=3)
+    assert row.slow_steps == 1 and row.compiles == 3
+    assert row.readback_ms == 6.5
+    assert row.mean_step_ms == 200.0 and row.median_step_ms == 100.0
 
 
 def test_rows_above_the_cap_are_flagged(bench):
@@ -105,8 +128,31 @@ def test_failed_row_and_table(bench):
     lines = table.splitlines()
     assert len(lines) == 4 and lines[0].startswith("| shape | batch | cap")
     assert "| tree16 | 1 | 16 | 16 | yes | 4.00 | 130.0 | 40.0 |" in lines[2]
+    assert lines[0].count("|") == lines[1].count("|") == lines[2].count("|")
     assert "| chain8 | 4 | 24 | 32 | no |" in lines[3]
     assert "FAIL: DtException: Incorrect chunk size" in lines[3]
+
+
+def test_error_summary_skips_the_inductor_header(bench):
+    class BackendCompilerFailed(Exception):  # noqa: N818 (torch's name)
+        pass
+
+    e = BackendCompilerFailed(
+        "backend='inductor' raised:\nInductorError: buf7 (SpyreReduction): stick\n\nmore"
+    )
+    assert bench.error_summary(e) == (
+        "BackendCompilerFailed: InductorError: buf7 (SpyreReduction): stick"
+    )
+    assert bench.error_summary(ValueError("one line")) == "ValueError: one line"
+    assert bench.error_summary(RuntimeError("")) == "RuntimeError: "
+
+
+def test_compile_count(bench):
+    import torch._dynamo.utils as dutils
+
+    before = bench.compile_count()
+    dutils.counters["stats"]["unique_graphs"] += 2
+    assert bench.compile_count() - before == 2
 
 
 def test_run_config_on_a_tiny_model(bench, monkeypatch):
@@ -148,12 +194,17 @@ def test_run_config_on_a_tiny_model(bench, monkeypatch):
         max_steps=12,
         eos=None,
         tree_drafters={"chain4": tree_drafter},
+        device_argmax=False,
     )
     # Cap 16 = all 16 experts of the tiny model: lossless, so greedy holds.
     row = bench.run_config(bsd, adapted, drafter, "chain4", 2, 16, prompts, refs, args)
     assert row.status == "ok" and row.requests == 4 and row.match_ar == 1.0
     assert row.rows == 8 and row.covers_top1 and row.tokens_per_step >= 1.0
     assert args.tree_drafters["chain4"] is tree_drafter
+    assert row.compiles == 0  # eager: nothing compiles in the measured steps
+    args.device_argmax = True
+    row = bench.run_config(bsd, adapted, drafter, "chain4", 2, 16, prompts, refs, args)
+    assert row.shape == "chain4+devargmax" and row.match_ar == 1.0
 
 
 # -- plain (non-speculative) batched decoding baseline ---------------------------

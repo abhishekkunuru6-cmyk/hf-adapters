@@ -28,6 +28,12 @@ then every group of ``batch`` prompts is measured.
   ``verify tok/s`` counts verify time only (the target's ceiling).
 - ``match_ar`` is the share of requests whose output equals the plain greedy
   ``generate`` of the same prompt (``--compare-ar``).
+- Diagnostics: ``readback ms`` is the part of ``verify ms`` that brings greedy
+  ids to the host (full logits, or chunk stats with ``--device-argmax``);
+  ``tok/row`` = tokens/step / width; ``active`` = share of requests still
+  decoding per step (finished ones still take verify rows); ``slow`` = steps
+  over 2x the median step; ``compiles`` = graphs compiled during measured
+  steps (should be 0).
 - Shape ``plain`` is the baseline without speculation: the adapter's own
   batched ``generate`` (1 token per request per step, ``rows`` = batch). Its
   decode time is ``generate(N) - generate(1)`` per group, so prefill is left
@@ -52,6 +58,7 @@ import json
 import os
 import statistics
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -136,9 +143,25 @@ class Row:
     match_ar: float | None = None  # share of requests equal to plain greedy
     median_first_diff: float | None = None
     error: str = ""
+    readback_ms: float = 0.0  # median per step: logits -> host greedy ids
+    tokens_per_row: float = 0.0  # tokens/step / width
+    active_share: float = 0.0  # mean share of requests still decoding per step
+    mean_step_ms: float = 0.0
+    median_step_ms: float = 0.0
+    slow_steps: int = 0  # steps over 2x the median step
+    compiles: int | None = None  # graphs compiled during the measured steps
 
 
-def summarize(shape, width, batch, cap, runs, matches=None, diffs=None):
+def compile_count():
+    """Graphs dynamo has compiled so far in this process."""
+    from torch._dynamo.utils import counters
+
+    return int(counters["stats"]["unique_graphs"])
+
+
+def summarize(
+    shape, width, batch, cap, runs, matches=None, diffs=None, *, compiles=None
+):
     """A ``Row`` from measured ``BatchStats`` runs of one configuration."""
     rows = batch * width
     emitted = [a for s in runs for a in s.emitted()]
@@ -147,6 +170,15 @@ def summarize(shape, width, batch, cap, runs, matches=None, diffs=None):
     host = [ms for s in runs for ms in s.host_ms]
     wall = sum(sum(s.draft_ms) + sum(s.verify_ms) + sum(s.host_ms) for s in runs)
     real_diffs = [d for d in (diffs or []) if d is not None]
+    readback = [ms for s in runs for ms in s.readback_ms]
+    step = [
+        d + v + h for s in runs for d, v, h in zip(s.draft_ms, s.verify_ms, s.host_ms)
+    ]
+    active = [
+        sum(a is not None for a in st) / len(st) for s in runs for st in s.accepted
+    ]
+    median_step = statistics.median(step) if step else 0.0
+    tokens_per_step = round(statistics.mean(emitted), 3) if emitted else 0.0
     return Row(
         shape=shape,
         width=width,
@@ -155,7 +187,7 @@ def summarize(shape, width, batch, cap, runs, matches=None, diffs=None):
         status="ok",
         rows=rows,
         covers_top1=cap is None or rows <= cap,
-        tokens_per_step=round(statistics.mean(emitted), 3) if emitted else 0.0,
+        tokens_per_step=tokens_per_step,
         verify_ms=round(statistics.median(verify), 2) if verify else 0.0,
         draft_ms=round(statistics.median(draft), 2) if draft else 0.0,
         host_ms=round(statistics.median(host), 2) if host else 0.0,
@@ -165,6 +197,13 @@ def summarize(shape, width, batch, cap, runs, matches=None, diffs=None):
         requests=sum(s.batch for s in runs),
         match_ar=None if matches is None else round(statistics.mean(matches), 3),
         median_first_diff=statistics.median(real_diffs) if real_diffs else None,
+        readback_ms=round(statistics.median(readback), 2) if readback else 0.0,
+        tokens_per_row=round(tokens_per_step / width, 3),
+        active_share=round(statistics.mean(active), 3) if active else 0.0,
+        mean_step_ms=round(statistics.mean(step), 2) if step else 0.0,
+        median_step_ms=round(median_step, 2),
+        slow_steps=sum(t > 2 * median_step for t in step),
+        compiles=compiles,
     )
 
 
@@ -203,6 +242,18 @@ def summarize_plain(batch, cap, decode_ms, *, steps):
     )
 
 
+def error_summary(e):
+    """``Type: message`` of a failure, skipping wrapper header lines.
+
+    Inductor's ``BackendCompilerFailed`` puts only ``backend='inductor'
+    raised:`` on its first line; the cause is on the next one.
+    """
+    lines = [ln.strip() for ln in str(e).strip().splitlines() if ln.strip()]
+    while len(lines) > 1 and lines[0].endswith("raised:"):
+        lines = lines[1:]
+    return f"{type(e).__name__}: {lines[0] if lines else ''}"
+
+
 def failed(shape, width, batch, cap, error):
     rows = batch * width
     return Row(
@@ -221,17 +272,21 @@ def format_table(rows):
     """Markdown table, one line per configuration."""
     header = (
         "| shape | batch | cap | rows | rows<=cap | tokens/step | verify ms "
-        "| draft ms/req | tok/s | verify tok/s | match_ar | status |"
+        "| draft ms/req | tok/s | verify tok/s | readback ms | tok/row | active "
+        "| slow | compiles | match_ar | status |"
     )
-    lines = [header, "|" + "---|" * 12]
+    lines = [header, "|" + "---|" * 17]
     for r in rows:
         match = "-" if r.match_ar is None else f"{r.match_ar:.2f}"
+        compiles = "-" if r.compiles is None else str(r.compiles)
         status = r.status if r.status == "ok" else f"FAIL: {r.error[:60]}"
         lines.append(
             f"| {r.shape} | {r.batch} | {r.cap} | {r.rows} "
             f"| {'yes' if r.covers_top1 else 'no'} | {r.tokens_per_step:.2f} "
             f"| {r.verify_ms:.1f} | {r.draft_ms:.1f} | {r.tokens_per_s:.1f} "
-            f"| {r.verify_tokens_per_s:.1f} | {match} | {status} |"
+            f"| {r.verify_tokens_per_s:.1f} | {r.readback_ms:.1f} "
+            f"| {r.tokens_per_row:.2f} | {r.active_share:.2f} | {r.slow_steps} "
+            f"| {compiles} | {match} | {status} |"
         )
     return "\n".join(lines)
 
@@ -272,8 +327,13 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
     shape = bsd.SHAPES[shape_name]
     bsd.configure_union_cap(target, cap)
     cache = args.tree_drafters
+    device_argmax = bool(getattr(args, "device_argmax", False))
     decoder = bsd.BatchedSpecDecoder(
-        target, drafter, shape, tree_drafter=cache.get(shape_name)
+        target,
+        drafter,
+        shape,
+        tree_drafter=cache.get(shape_name),
+        device_argmax=device_argmax,
     )
     cache[shape_name] = decoder.tree_drafter
     groups = prompt_groups(list(range(len(prompts))), batch)
@@ -288,6 +348,7 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
         return outs, decoder.stats
 
     run(groups[0])  # warmup: compiles every graph of this configuration
+    compiled_before = compile_count()
     runs, matches, diffs = [], [], []
     for group in groups:
         outs, stats = run(group)
@@ -298,13 +359,14 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
                 diffs.append(first_difference(out, ref))
                 matches.append(out == ref)
     return summarize(
-        shape_name,
+        shape_name + ("+devargmax" if device_argmax else ""),
         shape["width"],
         batch,
         cap,
         runs,
         matches if refs is not None else None,
         diffs,
+        compiles=compile_count() - compiled_before,
     )
 
 
@@ -344,6 +406,11 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--max-steps", type=int, default=64)
     p.add_argument("--compare-ar", action="store_true")
+    p.add_argument(
+        "--device-argmax",
+        action="store_true",
+        help="reduce verify logits to chunk stats on the device (A8)",
+    )
     p.add_argument("--output", help="write every row as JSON here (after each row)")
     args = p.parse_args()
     caps = [parse_cap(c) for c in args.caps]
@@ -394,13 +461,16 @@ def main():
                             bsd, target, drafter, shape, batch, cap, prompts, refs, args
                         )
                 except Exception as e:  # a failed compile must not end the sweep
-                    first = (str(e).strip().splitlines() or [""])[0]
+                    traceback.print_exc()  # the full error stays in the log
+                    label = shape
+                    if args.device_argmax and shape != PLAIN:
+                        label += "+devargmax"
                     row = failed(
-                        shape,
+                        label,
                         1 if shape == PLAIN else bsd.SHAPES[shape]["width"],
                         batch,
                         cap,
-                        f"{type(e).__name__}: {first}",
+                        error_summary(e),
                     )
                 rows.append(row)
                 print(
