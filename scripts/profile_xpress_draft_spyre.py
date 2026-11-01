@@ -39,6 +39,9 @@ Usage (Spyre pod; loads only the drafter and the target's embedding)::
     # where the chain search time goes
     ... --shapes chain8 --breakdown --threads 0 1 2 4 8
 
+    # one drafter forward for a whole batch (batched_xpress_drafter, A5)
+    ... --shapes chain8 --batched-forward 1 2 4 8
+
 ``--threads`` also reruns the per-shape profile once per torch thread count
 (0 = the process default), so the real draft loop (forward, then search,
 step after step) is timed at each count, not only the hot-loop breakdown.
@@ -49,6 +52,7 @@ import importlib.util
 import json
 import statistics
 import time
+import traceback
 from pathlib import Path
 
 
@@ -258,6 +262,35 @@ def format_breakdown(rows):
     return "\n".join(lines)
 
 
+def profile_batched(tree_drafter, batch, *, steps, warmup, context, accepted, seed=0):
+    """Median ms of one batched drafter forward for ``batch`` requests.
+
+    Each step appends ``accepted`` new rows per request, as the batched
+    decoder does; prompts are ``context`` random rows each.
+    """
+    import torch
+
+    bsd = _sibling("batched_spec_decode")
+    bxd = _sibling("batched_xpress_drafter")
+    d = tree_drafter
+    g = torch.Generator().manual_seed(seed)
+    width = len(d.target_layer_ids) * d.fc[0].shape[0]
+    bd = bxd.BatchedXPressDrafter(d, batch)
+    bd.reset(context, warmup + steps)
+    bd.append_prompts([torch.randn(context, width, generator=g) for _ in range(batch)])
+    times = []
+    for _ in range(warmup + steps):
+        anchors = [
+            int(d.vocab[t]) for t in torch.randint(0, d.count, (batch,), generator=g)
+        ]
+        new = [torch.randn(accepted, width, generator=g) for _ in range(batch)]
+        t0 = bsd._clock()
+        bd.draft(anchors, new)
+        times.append(bsd._clock() - t0)
+    forward = median_ms(times[warmup:])
+    return dict(batch=batch, forward_ms=forward, per_request_ms=forward / batch)
+
+
 def best_threads(rows, shape):
     """Thread count with the lowest median propose time for ``shape``."""
     mine = [r for r in rows if r.get("shape") == shape and "propose_ms" in r]
@@ -277,6 +310,14 @@ def main():
     p.add_argument("--accepted", type=int, default=4, help="new rows per step")
     p.add_argument("--breakdown", action="store_true", help="time each search step")
     p.add_argument("--threads", nargs="+", type=int, default=[0])
+    p.add_argument(
+        "--batched-forward",
+        nargs="+",
+        type=int,
+        default=[],
+        metavar="B",
+        help="time one batched drafter forward at these batch sizes (A5)",
+    )
     p.add_argument("--output", help="write the profile rows as JSON here")
     p.add_argument(
         "--pick-threads",
@@ -291,6 +332,8 @@ def main():
         return
     if any(t < 0 for t in args.threads):
         p.error("--threads values must be >= 0")
+    if any(b < 1 for b in args.batched_forward):
+        p.error("--batched-forward values must be >= 1")
 
     import torch
 
@@ -365,6 +408,29 @@ def main():
         print(format_breakdown(rows), flush=True)
         records.extend(dict(kind="breakdown") | r for r in rows)
         save()
+    if args.batched_forward:
+        if chain is None:
+            p.error("--batched-forward needs a plain chain shape in --shapes")
+        print("| batch | forward ms | per request ms | status |")
+        print("|---|---|---|---|")
+        for batch in sorted(args.batched_forward):
+            try:
+                r = profile_batched(
+                    chain[0],
+                    batch,
+                    steps=args.steps,
+                    warmup=args.warmup,
+                    context=args.context,
+                    accepted=args.accepted,
+                )
+                line = f"| {batch} | {r['forward_ms']:.1f} | {r['per_request_ms']:.1f} | ok |"
+                records.append(dict(kind="batched_forward") | r)
+            except Exception as e:  # a failed compile must not hide the others
+                traceback.print_exc()
+                line = f"| {batch} | - | - | FAIL: {type(e).__name__}: {str(e)[:80]} |"
+                records.append(dict(kind="batched_forward", batch=batch, error=str(e)))
+            print(line, flush=True)
+            save()
 
 
 if __name__ == "__main__":

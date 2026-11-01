@@ -35,7 +35,8 @@ then every group of ``batch`` prompts is measured.
   over 2x the median step; ``compiles`` = graphs compiled during measured
   steps (should be 0).
 - ``--draft-threads N`` drafts with ``N`` torch CPU threads (labels ``+dtN``);
-  the verify keeps the process default.
+  the verify keeps the process default. ``--batched-drafter`` runs one
+  drafter forward for the whole batch (labels ``+bdraft``).
 - Shape ``plain`` is the baseline without speculation: the adapter's own
   batched ``generate`` (1 token per request per step, ``rows`` = batch). Its
   decode time is ``generate(N) - generate(1)`` per group, so prefill is left
@@ -335,6 +336,8 @@ def config_label(shape_name, args):
     threads = getattr(args, "draft_threads", 0)
     if threads:
         label += f"+dt{threads}"
+    if getattr(args, "batched_drafter", False):
+        label += "+bdraft"
     return label
 
 
@@ -350,6 +353,7 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
         tree_drafter=cache.get(shape_name),
         device_argmax=device_argmax,
         draft_threads=getattr(args, "draft_threads", 0),
+        batched_drafter=bool(getattr(args, "batched_drafter", False)),
     )
     cache[shape_name] = decoder.tree_drafter
     groups = prompt_groups(list(range(len(prompts))), batch)
@@ -432,6 +436,11 @@ def main():
         type=int,
         default=0,
         help="torch CPU threads while drafting (A1); 0 = the process default",
+    )
+    p.add_argument(
+        "--batched-drafter",
+        action="store_true",
+        help="one drafter forward for the whole batch (A5)",
     )
     p.add_argument("--output", help="write every row as JSON here (after each row)")
     args = p.parse_args()

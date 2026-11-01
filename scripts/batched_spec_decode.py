@@ -35,6 +35,8 @@ verify forward per step, reusing #721's per-layer verify graphs
 - **One drafter, per-request state.** The drafter's request state (its
   context KV cache) is swapped per request; drafting runs one request at a
   time, so ``draft_ms`` is the sum over the batch, not a batched draft.
+  With ``batched_drafter`` one forward drafts every request instead
+  (``batched_xpress_drafter``); the host search stays per request.
 - **Beam chains** (``search="beam"``): the drafter's one forward is searched
   with a beam on the host, and only the path with the largest expected
   accepted length is verified, as a chain.
@@ -55,10 +57,12 @@ With greedy acceptance against the verify's own predictions, each request's
 output is its greedy continuation (as in #721) when the cap is off.
 """
 
+import importlib.util
 import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from hf_adapters._gemma4_tree import (
@@ -95,6 +99,16 @@ SHAPES = {
 
 CHUNK = 64  # columns per argmax chunk (one stick)
 ARGMAX_SLICE = 512 * CHUNK  # columns per reduction slice (see _xpress_tree)
+
+
+def _sibling(name):
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).with_name(f"{name}.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 # XPressTreeDrafter's per-request attributes (set by reset/append/draft).
 DRAFTER_STATE = ("capacity", "keys", "values", "block_index", "rows", "last_row")
@@ -554,10 +568,12 @@ class BatchedSpecDecoder:
         drafter_kwargs=None,
         device_argmax=False,
         draft_threads=0,
+        batched_drafter=False,
     ):
         """``tree_drafter``: a prebuilt ``XPressTreeDrafter`` for ``shape`` to reuse
         (keeps its compiled graphs across verifier rebuilds). ``draft_threads``:
-        torch CPU threads while drafting (0 = the process default)."""
+        torch CPU threads while drafting (0 = the process default).
+        ``batched_drafter``: one drafter forward for the whole batch."""
         with torch_threads(draft_threads):  # validates before any work
             pass
         self.draft_threads = draft_threads
@@ -578,6 +594,7 @@ class BatchedSpecDecoder:
             )
         self.tree_drafter = tree_drafter
         self.slots = DrafterSlots(tree_drafter)
+        self.batched_drafter = bool(batched_drafter)
         self.vocab_size = int(text_config(target.config).vocab_size)
         self.stats = None
 
@@ -594,6 +611,55 @@ class BatchedSpecDecoder:
                 new_features=new_rows,
             )
         return drafter.propose(anchor, predecessor, self.width, new_rows)
+
+    def _batched(self, batch):
+        """The batched drafter for ``batch`` requests, kept on the tree drafter
+        (as its per-request graphs are) so its graphs survive verifier rebuilds."""
+        cache = vars(self.tree_drafter).setdefault("_spec_batched", {})
+        if batch not in cache:
+            module = _sibling("batched_xpress_drafter")
+            cache[batch] = (
+                module,
+                module.BatchedXPressDrafter(self.tree_drafter, batch),
+            )
+        return cache[batch]
+
+    def _draft_step(self, outs, prompt_last, new_rows, active):
+        """``(tokens, parents)`` per request for this step (padded for inactive)."""
+        B, w = len(outs), self.width
+
+        def pred(b):
+            return outs[b][-2] if len(outs[b]) > 1 else prompt_last[b]
+
+        if not self.batched_drafter:
+            trees = []
+            for b in range(B):
+                if not active[b]:
+                    trees.append(pad_tree([outs[b][-1]], [-1], w))
+                    continue
+                with self.slots.use(b) as d:
+                    tokens, parents = self._propose(
+                        d, outs[b][-1], pred(b), new_rows[b]
+                    )
+                trees.append(pad_tree(tokens, parents, w))
+            return trees
+        module, bd = self._batched(B)
+        outputs = bd.draft([o[-1] for o in outs], new_rows, active)
+        trees = []
+        for b in range(B):
+            if not active[b]:
+                trees.append(pad_tree([outs[b][-1]], [-1], w))
+                continue
+            tokens, parents = module.search(
+                self.tree_drafter,
+                outputs[b],
+                outs[b][-1],
+                pred(b),
+                w,
+                propose=lambda d, a, p: self._propose(d, a, p, None),
+            )
+            trees.append(pad_tree(tokens, parents, w))
+        return trees
 
     @torch.no_grad()
     def generate(self, prompts, max_new_tokens, *, max_steps=None, eos_token_id=None):
@@ -612,10 +678,15 @@ class BatchedSpecDecoder:
         first = _host(logits[:, -1, : self.vocab_size]).argmax(-1).tolist()
         # Sized from the padded prefill, not the prompts: a size per batch would
         # recompile the drafter's graphs inside the measured steps.
-        self.slots.reset(B, v.state.pointer + max_new_tokens + w)
-        for b in range(B):
-            with self.slots.use(b) as d:
-                d.append(v.prompt_features(b))
+        if self.batched_drafter:
+            _, bd = self._batched(B)
+            bd.reset(v.state.pointer, max_steps)
+            bd.append_prompts([v.prompt_features(b) for b in range(B)])
+        else:
+            self.slots.reset(B, v.state.pointer + max_new_tokens + w)
+            for b in range(B):
+                with self.slots.use(b) as d:
+                    d.append(v.prompt_features(b))
         stats.prefill_ms = 1000 * (_clock() - t0)
         outs = [[int(t)] for t in first]
         prompt_last = [int(p[-1]) for p in prompts]
@@ -626,18 +697,9 @@ class BatchedSpecDecoder:
 
         while any(active(b) for b in range(B)) and stats.steps() < max_steps:
             t0 = _clock()
-            trees = []
             with torch_threads(self.draft_threads):
-                for b in range(B):
-                    if not active(b):
-                        trees.append(pad_tree([outs[b][-1]], [-1], w))
-                        continue
-                    pred = outs[b][-2] if len(outs[b]) > 1 else prompt_last[b]
-                    with self.slots.use(b) as d:
-                        tokens, parents = self._propose(
-                            d, outs[b][-1], pred, new_rows[b]
-                        )
-                    trees.append(pad_tree(tokens, parents, w))
+                flags = [active(b) for b in range(B)]
+                trees = self._draft_step(outs, prompt_last, new_rows, flags)
             t1 = _clock()
             logits = v.verify(trees)
             t_forward = _clock()

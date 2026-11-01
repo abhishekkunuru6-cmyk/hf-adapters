@@ -97,4 +97,22 @@ def test_probe_on_a_tiny_model(probe_mod, monkeypatch):
         assert r["prefill_picks"] == "plain"  # the prefill agrees with greedy
         assert r["margin"] > 0 and r["ref_rank"] == 1 and r["finite"]
     table = probe_mod.format_rows("chain4", rows)
-    assert table.count("\n") == 3 and "| chain4 | 0 | 4 |" in table
+    assert table.count("\n") == 3 and "| chain4 | 1 | 0 | 4 |" in table
+
+    # batch 2: both prompts decoded together, each probed on its own prefix
+    calls = []
+
+    def batched(batch, n):
+        calls.append(len(batch))
+        return flipped(batch, n)
+
+    monkeypatch.setattr(decoder, "generate", batched)
+    rows2 = probe_mod.probe(
+        decoder, prompts, refs, 10, 320, bench.first_difference, batch=2
+    )
+    assert calls == [2]
+    assert [r["batch"] for r in rows2] == [2, 2]
+    assert [r["ref_token"] for r in rows2] == [r["ref_token"] for r in rows]
+    assert [r["margin"] for r in rows2] == pytest.approx([r["margin"] for r in rows])
+    with pytest.raises(ValueError):
+        probe_mod.probe(decoder, prompts, refs, 10, 320, bench.first_difference, 3)

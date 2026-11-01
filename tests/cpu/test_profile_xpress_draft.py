@@ -139,3 +139,22 @@ def test_best_threads_and_pick_cli(prof, tmp_path, monkeypatch, capsys):
     )
     prof.main()
     assert capsys.readouterr().out.strip() == "4"
+
+
+def test_profile_batched(prof, monkeypatch):
+    from tests.cpu.test_gemma4_spec_decode import _drafter
+
+    from hf_adapters import _xpress_tree
+
+    d = _xpress_tree.XPressTreeDrafter(
+        _drafter(),
+        frontier=1,
+        branching=1,
+        depth=7,
+        dtype=torch.float32,
+        device="cpu",
+        compile=False,
+    )
+    r = prof.profile_batched(d, 3, steps=3, warmup=1, context=40, accepted=4)
+    assert r["batch"] == 3 and r["forward_ms"] > 0
+    assert r["per_request_ms"] == pytest.approx(r["forward_ms"] / 3)

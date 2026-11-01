@@ -208,6 +208,9 @@ def test_run_config_on_a_tiny_model(bench, monkeypatch):
     args.device_argmax, args.draft_threads = False, 1
     row = bench.run_config(bsd, adapted, drafter, "chain4", 2, 16, prompts, refs, args)
     assert row.shape == "chain4+dt1" and row.match_ar == 1.0
+    args.batched_drafter = True
+    row = bench.run_config(bsd, adapted, drafter, "chain4", 2, 16, prompts, refs, args)
+    assert row.shape == "chain4+dt1+bdraft" and row.match_ar == 1.0
 
 
 def test_config_label(bench):
@@ -217,6 +220,8 @@ def test_config_label(bench):
     both = ns(device_argmax=True, draft_threads=8)
     assert bench.config_label("chain8", both) == "chain8+devargmax+dt8"
     assert bench.config_label(bench.PLAIN, both) == bench.PLAIN
+    all3 = ns(device_argmax=True, draft_threads=8, batched_drafter=True)
+    assert bench.config_label("chain8", all3) == "chain8+devargmax+dt8+bdraft"
 
 
 # -- plain (non-speculative) batched decoding baseline ---------------------------
