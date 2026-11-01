@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tree16 rematch at batch (Gemma4 26B-A4B on #721), about 1-1.5 hours. Every
+# tree16 rematch at batch (Gemma4 26B-A4B on #721), about 1.5-2 hours. Every
 # part runs in its own process, because one compile failure makes every later
 # compile in the same process fail. Each part writes $OUT/<name>.log (+ .json)
 # and prints start / done lines here.
@@ -13,6 +13,9 @@
 #                      rematch for chain8's 1.87x at B=4
 #   5. t16_c16_b8_bd   tree16 cap 16 B=8, same fixes + batched drafter (only
 #                      useful if part 1 compiles)
+#   6. t16_c32_b1      tree16 cap 32 B=1 (16 rows), same fixes: the tree at a
+#                      likely clean cap, vs chain8's 1.56x at B=1 cap 32
+#   7. t16_c32_b2_bd   tree16 cap 32 B=2 (32 rows), same fixes + batched drafter
 #
 # Usage (Spyre pod, from #721's checkout; nothing outside $OUT is written):
 #
@@ -29,7 +32,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PY:-$HOME/dt-inductor/.venv/bin/python}"
 OUT="${OUT:-$HOME/xpress-al/overnight}"
 N="${N:-8}"
-ALL="t16_c16_b8 t16_c64_b4 t16_c16_b2_bd t16_c16_b4_bd t16_c16_b8_bd"
+ALL="t16_c16_b8 t16_c64_b4 t16_c16_b2_bd t16_c16_b4_bd t16_c16_b8_bd
+t16_c32_b1 t16_c32_b2_bd"
 PARTS="${PARTS:-$ALL}"
 PART_TIMEOUT="${PART_TIMEOUT:-40m}"
 LIMIT=()
@@ -68,6 +72,8 @@ bench t16_c64_b4 64 4
 bench t16_c16_b2_bd 16 2 --batched-drafter
 bench t16_c16_b4_bd 16 4 --batched-drafter
 bench t16_c16_b8_bd 16 8 --batched-drafter
+bench t16_c32_b1 32 1
+bench t16_c32_b2_bd 32 2 --batched-drafter
 
 # One file with every table and the first error lines, for pasting.
 {
