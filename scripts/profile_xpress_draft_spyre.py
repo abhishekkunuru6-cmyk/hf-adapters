@@ -46,6 +46,7 @@ step after step) is timed at each count, not only the hot-loop breakdown.
 
 import argparse
 import importlib.util
+import json
 import statistics
 import time
 from pathlib import Path
@@ -257,6 +258,14 @@ def format_breakdown(rows):
     return "\n".join(lines)
 
 
+def best_threads(rows, shape):
+    """Thread count with the lowest median propose time for ``shape``."""
+    mine = [r for r in rows if r.get("shape") == shape and "propose_ms" in r]
+    if not mine:
+        raise ValueError(f"no profile rows for shape {shape!r}")
+    return min(mine, key=lambda r: (r["propose_ms"], r["threads"]))["threads"]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--model", default="google/gemma-4-26B-A4B-it")
@@ -268,7 +277,20 @@ def main():
     p.add_argument("--accepted", type=int, default=4, help="new rows per step")
     p.add_argument("--breakdown", action="store_true", help="time each search step")
     p.add_argument("--threads", nargs="+", type=int, default=[0])
+    p.add_argument("--output", help="write the profile rows as JSON here")
+    p.add_argument(
+        "--pick-threads",
+        metavar="JSON",
+        help="print the fastest thread count for the first --shapes entry in a "
+        "previous --output file, then exit (loads no model)",
+    )
     args = p.parse_args()
+    if args.pick_threads:
+        with open(args.pick_threads) as f:
+            print(best_threads(json.load(f)["rows"], args.shapes[0]))
+        return
+    if any(t < 0 for t in args.threads):
+        p.error("--threads values must be >= 0")
 
     import torch
 
@@ -284,6 +306,13 @@ def main():
     print("| shape | threads | forward ms | search ms | propose ms | nodes |")
     print("|---|---|---|---|---|---|")
     chain = None
+    records = []
+
+    def save():
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(dict(rows=records), f, indent=1)
+
     default = torch.get_num_threads()
     for name in args.shapes:
         for t in args.threads:
@@ -305,6 +334,11 @@ def main():
                 f"| {r['propose_ms']:.1f} | {r['nodes']} |",
                 flush=True,
             )
+            records.append(
+                dict(shape=name, threads=used)
+                | {k: r[k] for k in ("forward_ms", "search_ms", "propose_ms", "nodes")}
+            )
+            save()
             o = shapes[name]
             if (
                 chain is None
@@ -329,6 +363,8 @@ def main():
             threads=args.threads,
         )
         print(format_breakdown(rows), flush=True)
+        records.extend(dict(kind="breakdown") | r for r in rows)
+        save()
 
 
 if __name__ == "__main__":

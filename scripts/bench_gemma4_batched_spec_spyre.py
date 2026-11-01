@@ -34,6 +34,8 @@ then every group of ``batch`` prompts is measured.
   decoding per step (finished ones still take verify rows); ``slow`` = steps
   over 2x the median step; ``compiles`` = graphs compiled during measured
   steps (should be 0).
+- ``--draft-threads N`` drafts with ``N`` torch CPU threads (labels ``+dtN``);
+  the verify keeps the process default.
 - Shape ``plain`` is the baseline without speculation: the adapter's own
   batched ``generate`` (1 token per request per step, ``rows`` = batch). Its
   decode time is ``generate(N) - generate(1)`` per group, so prefill is left
@@ -323,6 +325,19 @@ def _references(target, prompts, max_new_tokens):
     ]
 
 
+def config_label(shape_name, args):
+    """Row label: the shape plus the options that change how it runs."""
+    if shape_name == PLAIN:
+        return shape_name
+    label = shape_name
+    if getattr(args, "device_argmax", False):
+        label += "+devargmax"
+    threads = getattr(args, "draft_threads", 0)
+    if threads:
+        label += f"+dt{threads}"
+    return label
+
+
 def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args):
     shape = bsd.SHAPES[shape_name]
     bsd.configure_union_cap(target, cap)
@@ -334,6 +349,7 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
         shape,
         tree_drafter=cache.get(shape_name),
         device_argmax=device_argmax,
+        draft_threads=getattr(args, "draft_threads", 0),
     )
     cache[shape_name] = decoder.tree_drafter
     groups = prompt_groups(list(range(len(prompts))), batch)
@@ -359,7 +375,7 @@ def run_config(bsd, target, drafter, shape_name, batch, cap, prompts, refs, args
                 diffs.append(first_difference(out, ref))
                 matches.append(out == ref)
     return summarize(
-        shape_name + ("+devargmax" if device_argmax else ""),
+        config_label(shape_name, args),
         shape["width"],
         batch,
         cap,
@@ -411,9 +427,17 @@ def main():
         action="store_true",
         help="reduce verify logits to chunk stats on the device (A8)",
     )
+    p.add_argument(
+        "--draft-threads",
+        type=int,
+        default=0,
+        help="torch CPU threads while drafting (A1); 0 = the process default",
+    )
     p.add_argument("--output", help="write every row as JSON here (after each row)")
     args = p.parse_args()
     caps = [parse_cap(c) for c in args.caps]
+    if args.draft_threads < 0:
+        p.error("--draft-threads must be >= 0")
 
     import torch
     from transformers import AutoTokenizer
@@ -462,11 +486,8 @@ def main():
                         )
                 except Exception as e:  # a failed compile must not end the sweep
                     traceback.print_exc()  # the full error stays in the log
-                    label = shape
-                    if args.device_argmax and shape != PLAIN:
-                        label += "+devargmax"
                     row = failed(
-                        label,
+                        config_label(shape, args),
                         1 if shape == PLAIN else bsd.SHAPES[shape]["width"],
                         batch,
                         cap,

@@ -42,6 +42,14 @@ verify forward per step, reusing #721's per-layer verify graphs
   ``[B, width, vocab]`` logits to the host, the verify reduces them to each
   64-column chunk's max and first index (the XPress head's trick), and the
   host picks the winning chunk. ``readback_ms`` times this part of a verify.
+- **Draft threads** (``draft_threads``): the drafting phase of each step (all
+  ``B`` proposals) runs with this many torch CPU threads, and the previous
+  count is restored before the verify (whose host argmax wants them all).
+  The drafter's host search is a chain of small ops; right after a device
+  forward, a large pool pays to wake every thread for each of them. 0 keeps
+  the process default. Greedy outputs do not depend on it in exact
+  arithmetic; on Spyre, where a target near-tie can round either way
+  depending on which verify row computes the token, changed drafts can flip one.
 
 With greedy acceptance against the verify's own predictions, each request's
 output is its greedy continuation (as in #721) when the cap is off.
@@ -516,6 +524,22 @@ def _clock():
     return time.perf_counter()
 
 
+@contextmanager
+def torch_threads(n):
+    """Run the block with ``n`` torch CPU threads (``0``: leave as is), then restore."""
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError(f"thread count must be an integer >= 0, got {n!r}")
+    if n == 0:
+        yield
+        return
+    previous = torch.get_num_threads()
+    torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
 class BatchedSpecDecoder:
     """Batched drafter + verifier for one prepared target and one XPress drafter."""
 
@@ -529,9 +553,14 @@ class BatchedSpecDecoder:
         draft_vocab=None,
         drafter_kwargs=None,
         device_argmax=False,
+        draft_threads=0,
     ):
         """``tree_drafter``: a prebuilt ``XPressTreeDrafter`` for ``shape`` to reuse
-        (keeps its compiled graphs across verifier rebuilds)."""
+        (keeps its compiled graphs across verifier rebuilds). ``draft_threads``:
+        torch CPU threads while drafting (0 = the process default)."""
+        with torch_threads(draft_threads):  # validates before any work
+            pass
+        self.draft_threads = draft_threads
         self.width = int(shape["width"])
         self.shape = dict(shape)
         self.taps = tuple(drafter.target_layer_ids)
@@ -598,14 +627,17 @@ class BatchedSpecDecoder:
         while any(active(b) for b in range(B)) and stats.steps() < max_steps:
             t0 = _clock()
             trees = []
-            for b in range(B):
-                if not active(b):
-                    trees.append(pad_tree([outs[b][-1]], [-1], w))
-                    continue
-                pred = outs[b][-2] if len(outs[b]) > 1 else prompt_last[b]
-                with self.slots.use(b) as d:
-                    tokens, parents = self._propose(d, outs[b][-1], pred, new_rows[b])
-                trees.append(pad_tree(tokens, parents, w))
+            with torch_threads(self.draft_threads):
+                for b in range(B):
+                    if not active(b):
+                        trees.append(pad_tree([outs[b][-1]], [-1], w))
+                        continue
+                    pred = outs[b][-2] if len(outs[b]) > 1 else prompt_last[b]
+                    with self.slots.use(b) as d:
+                        tokens, parents = self._propose(
+                            d, outs[b][-1], pred, new_rows[b]
+                        )
+                    trees.append(pad_tree(tokens, parents, w))
             t1 = _clock()
             logits = v.verify(trees)
             t_forward = _clock()

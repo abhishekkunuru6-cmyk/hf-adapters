@@ -115,3 +115,27 @@ def test_search_breakdown(prof, monkeypatch):
     assert (
         table.splitlines()[0].startswith("| threads |") and len(table.splitlines()) == 4
     )
+
+
+def test_best_threads_and_pick_cli(prof, tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+
+    rows = [
+        dict(shape="chain8", threads=72, propose_ms=49.5),
+        dict(shape="chain8", threads=8, propose_ms=27.0),
+        dict(shape="chain8", threads=4, propose_ms=27.0),
+        dict(shape="tree16", threads=1, propose_ms=1.0),
+        dict(kind="breakdown", threads=1, chain_search_ms=7.0),
+    ]
+    assert prof.best_threads(rows, "chain8") == 4  # ties go to fewer threads
+    assert prof.best_threads(rows, "tree16") == 1
+    with pytest.raises(ValueError, match="no profile rows"):
+        prof.best_threads(rows, "chain16")
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps(dict(rows=rows)))
+    monkeypatch.setattr(
+        sys, "argv", ["p", "--shapes", "chain8", "--pick-threads", str(path)]
+    )
+    prof.main()
+    assert capsys.readouterr().out.strip() == "4"

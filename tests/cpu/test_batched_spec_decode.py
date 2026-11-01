@@ -388,3 +388,58 @@ def test_new_shapes_decode_greedy(bsd, models, monkeypatch, shape):
     stats = decoder.stats
     assert len(stats.readback_ms) == stats.steps()
     assert all(r <= v for r, v in zip(stats.readback_ms, stats.verify_ms))
+
+
+def test_torch_threads_sets_and_restores(bsd):
+    before = torch.get_num_threads()
+    with bsd.torch_threads(1):
+        assert torch.get_num_threads() == 1
+    assert torch.get_num_threads() == before
+    with pytest.raises(RuntimeError, match="boom"):
+        with bsd.torch_threads(1):
+            raise RuntimeError("boom")
+    assert torch.get_num_threads() == before  # restored on error too
+    with bsd.torch_threads(0):
+        assert torch.get_num_threads() == before  # 0 leaves it as is
+    for bad in (-1, 1.5, True, "2"):
+        with pytest.raises(ValueError, match="thread count"):
+            with bsd.torch_threads(bad):
+                pass
+
+
+def test_draft_threads_apply_to_drafting_only_and_keep_outputs(
+    bsd, models, monkeypatch
+):
+    from tests.cpu.test_gemma4_spec_decode import _drafter
+
+    _, adapted = models
+    bsd.configure_union_cap(adapted, None)
+    monkeypatch.setattr(_xpress_tree.torch, "compile", lambda fn, **_: fn)
+    prompts = _prompts(25, 38, seed=9)
+    kwargs = dict(dtype=torch.float32, device="cpu", compile=False)
+    shape = bsd.SHAPES["chain4"]
+    base = bsd.BatchedSpecDecoder(adapted, _drafter(), shape, drafter_kwargs=kwargs)
+    expected = base.generate(prompts, max_new_tokens=16)
+
+    decoder = bsd.BatchedSpecDecoder(
+        adapted, _drafter(), shape, drafter_kwargs=kwargs, draft_threads=1
+    )
+    default = torch.get_num_threads()
+    seen = {"propose": set(), "verify": set()}
+    real_propose, real_verify = decoder._propose, decoder.verifier.verify
+
+    def propose(*a, **kw):
+        seen["propose"].add(torch.get_num_threads())
+        return real_propose(*a, **kw)
+
+    def verify(*a, **kw):
+        seen["verify"].add(torch.get_num_threads())
+        return real_verify(*a, **kw)
+
+    monkeypatch.setattr(decoder, "_propose", propose)
+    monkeypatch.setattr(decoder.verifier, "verify", verify)
+    assert decoder.generate(prompts, max_new_tokens=16) == expected
+    assert seen == {"propose": {1}, "verify": {default}}
+    assert torch.get_num_threads() == default
+    with pytest.raises(ValueError, match="thread count"):
+        bsd.BatchedSpecDecoder(adapted, _drafter(), shape, draft_threads=-2)
