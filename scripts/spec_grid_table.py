@@ -51,8 +51,13 @@ def collect(paths, label):
         except (OSError, ValueError, AttributeError) as e:
             print(f"skipping {path}: {e}")
             continue
+        if not isinstance(rows, list):  # e.g. a probe JSON: rows per shape
+            continue
         for r in rows:
-            if r.get("shape") not in (label, label + BATCHED):
+            if not isinstance(r, dict) or r.get("shape") not in (
+                label,
+                label + BATCHED,
+            ):
                 continue
             key = (str(r["cap"]), int(r["batch"]), r["shape"].endswith(BATCHED))
             old = cells.get(key)

@@ -85,6 +85,12 @@ def test_bad_file_is_skipped(grid, tmp_path, capsys):
     bad.write_text("{not json")
     assert grid.collect([str(bad)], LABEL) == {}
     assert "skipping" in capsys.readouterr().out
+    # a probe JSON keeps rows per shape; a bench row list may hold junk
+    probe = tmp_path / "probe.json"
+    probe.write_text(json.dumps(dict(cap="64", rows={"chain8 B=2": [{"prompt": 0}]})))
+    junk = _write(tmp_path / "junk.json", ["x", _row(LABEL, "16", 1, 30.7)], 1000)
+    cells = grid.collect([str(probe), junk], LABEL)
+    assert list(cells) == [("16", 1, False)]
 
 
 def test_has_exit_code(tmp_path):
